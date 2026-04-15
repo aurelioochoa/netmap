@@ -1,0 +1,23 @@
+[package]
+name = "netmap"
+version = "0.1.0"
+edition = "2021"
+description = "CLI tool that discovers and renders a network topology map in the terminal"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+quick-xml = { version = "0.31", features = ["serialize"] }
+regex = "1"
+anyhow = "1"
+which = "6"
+libc = "0.2"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[build-dependencies]
+which = "6"

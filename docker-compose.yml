@@ -1,0 +1,8 @@
+services:
+  netmap:
+    build: .
+    image: netmap:latest
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    command: ["scan", "192.168.1.0/24", "--no-tui"]
