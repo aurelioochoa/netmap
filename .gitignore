@@ -1,0 +1,38 @@
+# --- Rust / Cargo ----------------------------------------------------------
+# Build output + incremental artefacts. NEVER commit this.
+/target/
+# Per-user override of workspace-level Cargo config.
+.cargo/
+# Historical panic dumps left behind by older cargo versions.
+**/*.rs.bk
+
+# --- Netmap runtime output -------------------------------------------------
+# Files the `--output` flag can produce. Keep checked-in samples if you want
+# by naming them e.g. `example-map.svg` and adding a negation below.
+/*.json
+/*.svg
+/scan-*.json
+/scan-*.svg
+
+# --- Secrets / local config ------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# --- Editor / IDE ----------------------------------------------------------
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+
+# --- OS noise --------------------------------------------------------------
+.DS_Store
+Thumbs.db
+
+# --- Misc ------------------------------------------------------------------
+*.log
+perf.data
+perf.data.old
+flamegraph.svg

@@ -1,2 +1,0 @@
-cargo:warning=arp-scan not found in PATH. The 'arp-scan' backend will be unavailable at runtime.
-cargo:warning=traceroute not found in PATH. The 'traceroute' backend will be unavailable at runtime.
