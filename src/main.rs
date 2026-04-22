@@ -7,10 +7,15 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use model::BackendKind;
 use backends::ScanOptions;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(name = "netmap", version, about = "Discover and render network topology maps")]
 struct Cli {
+    /// Increase log verbosity: -v for debug, -vv for trace
+    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
+    verbose: u8,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -45,7 +50,32 @@ enum Commands {
         /// Skip a backend (can be repeated): ip-neigh, arp-scan, nmap, traceroute
         #[arg(long, value_delimiter = ',')]
         skip: Vec<String>,
+
+        /// Include hosts whose IP falls outside the target CIDR (docker bridge,
+        /// IPv6 link-local, etc.). By default these are filtered out.
+        #[arg(long, default_value_t = false)]
+        show_off_target: bool,
     },
+}
+
+/// Initialize tracing so logs are visible by default.
+/// Precedence: `RUST_LOG` env var > `-v/-vv` CLI flag > built-in default (`info`).
+/// Logs are written to stderr so stdout stays clean for the rendered tree/JSON output.
+fn init_tracing(verbose: u8) {
+    let cli_default = match verbose {
+        0 => "netmap=info,warn",
+        1 => "netmap=debug,info",
+        _ => "netmap=trace,debug",
+    };
+
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(cli_default));
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .init();
 }
 
 fn parse_backend_kind(s: &str) -> Option<BackendKind> {
@@ -60,9 +90,9 @@ fn parse_backend_kind(s: &str) -> Option<BackendKind> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
-
     let cli = Cli::parse();
+
+    init_tracing(cli.verbose);
 
     match cli.command {
         Commands::Scan {
@@ -73,6 +103,7 @@ async fn main() -> Result<()> {
             output,
             no_tui: _,
             skip,
+            show_off_target,
         } => {
             let skip_backends: Vec<BackendKind> = skip
                 .iter()
@@ -91,11 +122,28 @@ async fn main() -> Result<()> {
                 port_range: ports,
                 skip_backends,
                 max_parallel: 10,
+                show_off_target,
             };
+
+            tracing::info!(
+                target = %target,
+                sudo = opts.sudo,
+                timeout_secs = opts.timeout_secs,
+                port_range = %opts.port_range,
+                max_parallel = opts.max_parallel,
+                skip = ?opts.skip_backends,
+                "netmap starting scan"
+            );
 
             let graph = pipeline::run_pipeline(&target, &opts).await?;
             let tree = renderer::render_tree(&graph);
             print!("{}", tree);
+
+            let ports_table = renderer::render_ports_table(&graph);
+            if !ports_table.is_empty() {
+                println!();
+                print!("{}", ports_table);
+            }
 
             // Phase 3: JSON/SVG output
             if let Some(path) = output {

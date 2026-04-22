@@ -21,10 +21,11 @@ fmt:
 lint:
 	cargo clippy -- -D warnings
 
-TARGET ?= 192.168.1.0/24
+TARGET ?= 192.168.2.0/24
+RUST_LOG ?= info
 
 run:
-	cargo run -- scan $(TARGET) --no-tui --sudo
+	RUST_LOG=$(RUST_LOG) cargo run -- scan $(TARGET) --no-tui --sudo
 
 install: release
 	sudo ln -sf $(CURDIR)/target/release/netmap /usr/local/bin/netmap

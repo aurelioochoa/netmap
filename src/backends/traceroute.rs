@@ -26,14 +26,32 @@ impl ScanBackend for TracerouteBackend {
     }
 
     async fn scan(&self, target: &str, _opts: &ScanOptions) -> Result<ScanResult> {
+        tracing::info!(cmd = %format!("traceroute -n {}", target), "traceroute: executing");
+        let started = std::time::Instant::now();
+
         let output = Command::new("traceroute")
             .args(["-n", target])
             .output()
             .await?;
 
+        tracing::debug!(
+            exit = ?output.status.code(),
+            stdout_bytes = output.stdout.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "traceroute: command finished"
+        );
+        if !output.status.success() {
+            tracing::warn!(
+                "traceroute exited with {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
         let stdout = String::from_utf8_lossy(&output.stdout);
         let target_ip: IpAddr = target.parse().unwrap_or("0.0.0.0".parse().unwrap());
         let (hosts, edges) = parse_traceroute_output(&stdout, target_ip);
+        tracing::info!(hosts = hosts.len(), edges = edges.len(), "traceroute: parsed output");
 
         Ok(ScanResult { hosts, edges })
     }
@@ -46,34 +64,76 @@ pub async fn run_traceroute_all(
     let mut join_set = JoinSet::new();
     let mut all_hosts = Vec::new();
     let mut all_edges = Vec::new();
+    let total = targets.len();
+    let batches = targets.chunks(opts.max_parallel).count();
+    let mut completed: usize = 0;
 
-    for chunk in targets.chunks(opts.max_parallel) {
+    for (batch_idx, chunk) in targets.chunks(opts.max_parallel).enumerate() {
+        tracing::info!(
+            batch = batch_idx + 1,
+            batches,
+            batch_size = chunk.len(),
+            completed,
+            total,
+            "traceroute: starting batch"
+        );
+        let batch_start = std::time::Instant::now();
+
         for &ip in chunk {
             join_set.spawn(async move {
+                let started = std::time::Instant::now();
+                tracing::info!(host = %ip, cmd = %format!("traceroute -n {}", ip), "traceroute: executing");
                 let output = Command::new("traceroute")
                     .args(["-n", &ip.to_string()])
                     .output()
                     .await;
-                (ip, output)
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                (ip, output, elapsed_ms)
             });
         }
 
         while let Some(result) = join_set.join_next().await {
             match result {
-                Ok((target_ip, Ok(output))) => {
+                Ok((target_ip, Ok(output), elapsed_ms)) => {
+                    if !output.status.success() {
+                        tracing::warn!(
+                            host = %target_ip,
+                            exit = ?output.status.code(),
+                            elapsed_ms,
+                            "traceroute exited non-zero: {}",
+                            String::from_utf8_lossy(&output.stderr).trim()
+                        );
+                    }
                     let stdout = String::from_utf8_lossy(&output.stdout);
                     let (hosts, edges) = parse_traceroute_output(&stdout, target_ip);
+                    tracing::info!(
+                        host = %target_ip,
+                        hops = hosts.len(),
+                        edges = edges.len(),
+                        elapsed_ms,
+                        "traceroute: per-host done"
+                    );
                     all_hosts.extend(hosts);
                     all_edges.extend(edges);
                 }
-                Ok((ip, Err(e))) => {
-                    tracing::warn!("traceroute to {} failed: {}", ip, e);
+                Ok((ip, Err(e), elapsed_ms)) => {
+                    tracing::warn!(host = %ip, elapsed_ms, "traceroute spawn failed: {}", e);
                 }
                 Err(e) => {
                     tracing::warn!("traceroute task panicked: {}", e);
                 }
             }
+            completed += 1;
         }
+
+        tracing::info!(
+            batch = batch_idx + 1,
+            batches,
+            completed,
+            total,
+            elapsed_ms = batch_start.elapsed().as_millis() as u64,
+            "traceroute: batch done"
+        );
     }
 
     Ok(ScanResult {

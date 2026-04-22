@@ -117,6 +117,95 @@ pub fn render_tree(graph: &HostGraph) -> String {
     output
 }
 
+/// Render a columnar table of every host that has at least one open port.
+/// Returns an empty string if no host has any ports, so the caller can skip
+/// printing the header altogether.
+///
+/// Columns: IP, Hostname, Role, Ports (formatted as `22/ssh, 53/domain, ...`
+/// or just `22, 80` when the service name is unknown).
+pub fn render_ports_table(graph: &HostGraph) -> String {
+    // Collect rows for hosts with at least one port, sorted by IP.
+    let mut hosts_with_ports: Vec<&Host> = graph
+        .hosts
+        .values()
+        .filter(|h| !h.open_ports.is_empty())
+        .collect();
+    if hosts_with_ports.is_empty() {
+        return String::new();
+    }
+    hosts_with_ports.sort_by_key(|h| match h.ip {
+        IpAddr::V4(v4) => {
+            let mut v = vec![0u8]; // v4 sorts before v6
+            v.extend_from_slice(&v4.octets());
+            v
+        }
+        IpAddr::V6(v6) => {
+            let mut v = vec![1u8];
+            v.extend_from_slice(&v6.octets());
+            v
+        }
+    });
+
+    // Build row tuples so we can compute column widths.
+    let header = ("IP", "Hostname", "Role", "Ports");
+    let rows: Vec<(String, String, String, String)> = hosts_with_ports
+        .iter()
+        .map(|h| {
+            let ip = h.ip.to_string();
+            let hostname = h.hostname.clone().unwrap_or_default();
+            let role = format!("{}", h.role);
+            let ports = h
+                .open_ports
+                .iter()
+                .map(|p| match &p.service {
+                    Some(svc) if !svc.is_empty() => format!("{}/{}", p.number, svc),
+                    _ => p.number.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            (ip, hostname, role, ports)
+        })
+        .collect();
+
+    let w_ip = rows.iter().map(|r| r.0.len()).chain([header.0.len()]).max().unwrap_or(0);
+    let w_host = rows.iter().map(|r| r.1.len()).chain([header.1.len()]).max().unwrap_or(0);
+    let w_role = rows.iter().map(|r| r.2.len()).chain([header.2.len()]).max().unwrap_or(0);
+
+    let mut out = String::new();
+    out.push_str("Open Ports:\n");
+    out.push_str(&format!(
+        "{:<w_ip$}  {:<w_host$}  {:<w_role$}  {}\n",
+        header.0,
+        header.1,
+        header.2,
+        header.3,
+        w_ip = w_ip,
+        w_host = w_host,
+        w_role = w_role,
+    ));
+    // Underline
+    out.push_str(&format!(
+        "{}  {}  {}  {}\n",
+        "-".repeat(w_ip),
+        "-".repeat(w_host),
+        "-".repeat(w_role),
+        "-".repeat(header.3.len()),
+    ));
+    for (ip, hostname, role, ports) in &rows {
+        out.push_str(&format!(
+            "{:<w_ip$}  {:<w_host$}  {:<w_role$}  {}\n",
+            ip,
+            hostname,
+            role,
+            ports,
+            w_ip = w_ip,
+            w_host = w_host,
+            w_role = w_role,
+        ));
+    }
+    out
+}
+
 fn build_adjacency(edges: &[HopEdge]) -> HashMap<IpAddr, BTreeSet<IpAddr>> {
     let mut adj: HashMap<IpAddr, BTreeSet<IpAddr>> = HashMap::new();
     for edge in edges {
@@ -159,22 +248,10 @@ fn bfs_layers(
 
 fn node_label(graph: &HostGraph, ip: IpAddr) -> String {
     if let Some(host) = graph.hosts.get(&ip) {
-        let role_str = format!("{}", host.role);
-        let mut label = role_str;
-
+        let mut label = format!("{} {}", host.role, ip);
         if let Some(ref name) = host.hostname {
             label = format!("{} ({})", label, name);
         }
-
-        // Append top 3 ports
-        let port_strs: Vec<String> = host.open_ports.iter()
-            .take(3)
-            .map(|p| format!(":{}", p.number))
-            .collect();
-        if !port_strs.is_empty() {
-            label = format!("{} {}", label, port_strs.join(" "));
-        }
-
         label
     } else {
         format!("{}", ip)
@@ -467,7 +544,8 @@ mod tests {
         assert!(lines[6].contains("wap/switch"), "Expected 'wap/switch', got: '{}'", lines[6]);
         assert!(lines[6].contains("mesh-ap"), "Expected 'mesh-ap', got: '{}'", lines[6]);
         assert!(lines[6].contains("server"), "Expected 'server', got: '{}'", lines[6]);
-        assert!(lines[6].contains(":80"), "Expected ':80', got: '{}'", lines[6]);
+        // IPs now appear in every label
+        assert!(lines[6].contains("192.168.1.10"), "Expected server IP in label, got: '{}'", lines[6]);
 
         // Line 7: vertical connectors (wap1 and wap3 connect down)
         assert!(lines[7].contains('|'), "Expected '|' connector, got: '{}'", lines[7]);
@@ -482,11 +560,20 @@ mod tests {
 
         // Line 10: layer 4 — server2 and laptop
         assert!(lines[10].contains("server"), "Expected 'server', got: '{}'", lines[10]);
-        assert!(lines[10].contains(":22"), "Expected ':22', got: '{}'", lines[10]);
+        assert!(lines[10].contains("192.168.1.16"), "Expected server2 IP, got: '{}'", lines[10]);
         assert!(lines[10].contains("laptop"), "Expected 'laptop', got: '{}'", lines[10]);
 
-        // Verify total structure: 11 lines
+        // Verify total structure: 11 lines (tree only; ports table is separate)
         assert!(lines.len() == 11, "Expected 11 lines, got {}: {:?}", lines.len(), lines);
+
+        // Ports now live in the companion table. Verify via render_ports_table.
+        let ports_out = render_ports_table(&graph);
+        assert!(ports_out.contains("192.168.1.10"), "expected server in ports table:\n{}", ports_out);
+        assert!(ports_out.contains("80"), "expected port 80 in ports table:\n{}", ports_out);
+        assert!(ports_out.contains("443"), "expected port 443 in ports table:\n{}", ports_out);
+        assert!(ports_out.contains("192.168.1.16"), "expected server2 in ports table:\n{}", ports_out);
+        assert!(ports_out.contains("22"), "expected port 22 in ports table:\n{}", ports_out);
+        assert!(ports_out.contains("8080"), "expected port 8080 in ports table:\n{}", ports_out);
     }
 
     #[test]
@@ -508,5 +595,98 @@ mod tests {
         assert!(output.contains("unknown"));
         // No "Internet" header without gateway
         assert!(!output.contains("Internet"));
+    }
+
+    #[test]
+    fn test_node_label_includes_ip() {
+        let host = make_host("192.168.2.1", DeviceRole::Gateway, Some("OpenWrt.lan"), vec![22, 80]);
+        let mut hosts = HashMap::new();
+        hosts.insert(host.ip, host);
+        let graph = HostGraph {
+            hosts,
+            edges: Vec::new(),
+            gateway: Some("192.168.2.1".parse().unwrap()),
+        };
+        let label = node_label(&graph, "192.168.2.1".parse().unwrap());
+        assert!(label.contains("router"), "expected role: {}", label);
+        assert!(label.contains("192.168.2.1"), "expected IP: {}", label);
+        assert!(label.contains("OpenWrt.lan"), "expected hostname: {}", label);
+        // Ports must NOT be in the label anymore (they live in the ports table).
+        assert!(!label.contains(":22"), "ports should not appear inline: {}", label);
+        assert!(!label.contains(":80"), "ports should not appear inline: {}", label);
+    }
+
+    #[test]
+    fn test_ports_table_basic() {
+        let mut h1 = make_host("192.168.2.1", DeviceRole::Gateway, Some("OpenWrt.lan"), vec![22, 53, 80]);
+        // Add service names on some ports
+        h1.open_ports[0].service = Some("ssh".to_string());
+        h1.open_ports[1].service = Some("domain".to_string());
+        h1.open_ports[2].service = Some("http".to_string());
+        let h2 = make_host("192.168.2.125", DeviceRole::Server, Some("mainframe"), vec![22]);
+        let h3_noports = make_host("192.168.2.200", DeviceRole::Unknown, None, vec![]);
+
+        let mut hosts = HashMap::new();
+        hosts.insert(h1.ip, h1);
+        hosts.insert(h2.ip, h2);
+        hosts.insert(h3_noports.ip, h3_noports);
+
+        let graph = HostGraph {
+            hosts,
+            edges: Vec::new(),
+            gateway: Some("192.168.2.1".parse().unwrap()),
+        };
+
+        let out = render_ports_table(&graph);
+        // Header is present
+        assert!(out.starts_with("Open Ports:\n"), "missing header: {}", out);
+        assert!(out.contains("IP"));
+        assert!(out.contains("Hostname"));
+        assert!(out.contains("Role"));
+        assert!(out.contains("Ports"));
+
+        // Both hosts with ports are listed
+        assert!(out.contains("192.168.2.1"));
+        assert!(out.contains("OpenWrt.lan"));
+        assert!(out.contains("22/ssh"));
+        assert!(out.contains("53/domain"));
+        assert!(out.contains("80/http"));
+        assert!(out.contains("192.168.2.125"));
+        assert!(out.contains("mainframe"));
+
+        // Host without ports does not appear
+        assert!(!out.contains("192.168.2.200"), "host with no ports should not appear: {}", out);
+
+        // Host without a named service falls back to the bare port number
+        let h_noname = {
+            let mut h = make_host("192.168.2.250", DeviceRole::Server, None, vec![8080]);
+            h.open_ports[0].service = None;
+            h
+        };
+        let mut hosts2 = HashMap::new();
+        hosts2.insert(h_noname.ip, h_noname);
+        let graph2 = HostGraph {
+            hosts: hosts2,
+            edges: Vec::new(),
+            gateway: None,
+        };
+        let out2 = render_ports_table(&graph2);
+        assert!(out2.contains("192.168.2.250"), "unnamed-svc host should appear: {}", out2);
+        // The "8080" should NOT be followed by '/' (no service suffix)
+        assert!(out2.contains(" 8080\n") || out2.ends_with(" 8080\n"), "expected bare port 8080: {}", out2);
+    }
+
+    #[test]
+    fn test_ports_table_empty_when_no_ports() {
+        let h = make_host("192.168.2.50", DeviceRole::Unknown, None, vec![]);
+        let mut hosts = HashMap::new();
+        hosts.insert(h.ip, h);
+        let graph = HostGraph {
+            hosts,
+            edges: Vec::new(),
+            gateway: None,
+        };
+        let out = render_ports_table(&graph);
+        assert_eq!(out, "", "empty port set should produce empty output, got: {:?}", out);
     }
 }

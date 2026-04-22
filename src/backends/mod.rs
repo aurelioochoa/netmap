@@ -31,6 +31,10 @@ pub struct ScanOptions {
     pub port_range: String,
     pub skip_backends: Vec<BackendKind>,
     pub max_parallel: usize,
+    /// When `target` is a CIDR, by default we drop hosts whose IPs fall outside
+    /// of it (removes docker-bridge / IPv6 link-local noise leaked by ip-neigh).
+    /// Setting this to `true` disables the filter so every discovered host appears.
+    pub show_off_target: bool,
 }
 
 impl Default for ScanOptions {
@@ -41,6 +45,7 @@ impl Default for ScanOptions {
             port_range: String::new(),
             skip_backends: Vec::new(),
             max_parallel: 10,
+            show_off_target: false,
         }
     }
 }
@@ -49,15 +54,6 @@ impl Default for ScanOptions {
 pub struct ScanResult {
     pub hosts: Vec<PartialHost>,
     pub edges: Vec<HopEdge>,
-}
-
-impl ScanResult {
-    pub fn empty() -> Self {
-        Self {
-            hosts: Vec::new(),
-            edges: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

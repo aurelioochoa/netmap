@@ -25,5 +25,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /app/target/release/netmap /usr/local/bin/netmap
 
+# Default log verbosity; override with `-e RUST_LOG=debug` or in compose.
+ENV RUST_LOG=info
+
 ENTRYPOINT ["netmap"]
 CMD ["scan", "--help"]

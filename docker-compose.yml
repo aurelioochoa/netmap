@@ -2,7 +2,16 @@ services:
   netmap:
     build: .
     image: netmap:latest
+    # Share the host's network namespace so arp-scan, `ip neigh`, and nmap's
+    # ARP fast-path all operate against the real LAN instead of the docker bridge.
+    # Linux-only; on macOS/Windows use the default bridge mode.
+    network_mode: host
     cap_add:
       - NET_RAW
       - NET_ADMIN
-    command: ["scan", "192.168.1.0/24", "--no-tui"]
+    environment:
+      # Override with `RUST_LOG=debug docker compose up` for per-host command logs.
+      RUST_LOG: ${RUST_LOG:-info}
+    # Force stdout/stderr to be unbuffered so logs appear live in `docker compose up`.
+    tty: true
+    command: ["scan", "192.168.2.0/24", "--no-tui"]

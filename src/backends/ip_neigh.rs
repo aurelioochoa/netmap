@@ -28,20 +28,33 @@ impl ScanBackend for IpNeighBackend {
     }
 
     async fn scan(&self, _target: &str, _opts: &ScanOptions) -> Result<ScanResult> {
-        let output = if cfg!(target_os = "linux") {
-            Command::new("ip")
-                .args(["neigh", "show"])
-                .output()
-                .await?
+        let (program, args): (&str, &[&str]) = if cfg!(target_os = "linux") {
+            ("ip", &["neigh", "show"])
         } else {
-            Command::new("arp")
-                .args(["-an"])
-                .output()
-                .await?
+            ("arp", &["-an"])
         };
+        tracing::info!(cmd = %format!("{} {}", program, args.join(" ")), "ip-neigh: executing");
+
+        let output = Command::new(program).args(args).output().await?;
+
+        tracing::debug!(
+            exit = ?output.status.code(),
+            stdout_bytes = output.stdout.len(),
+            stderr_bytes = output.stderr.len(),
+            "ip-neigh: command finished"
+        );
+        if !output.status.success() {
+            tracing::warn!(
+                "ip-neigh: {} exited with {:?}: {}",
+                program,
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let hosts = parse_output(&stdout);
+        tracing::info!(hosts = hosts.len(), "ip-neigh: parsed neighbor table");
 
         Ok(ScanResult {
             hosts,

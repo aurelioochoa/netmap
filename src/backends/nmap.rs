@@ -36,6 +36,17 @@ pub async fn run_nmap_discovery(target: &str, opts: &ScanOptions) -> Result<Scan
     let args = vec!["-sn", target, "-oX", "-"];
     let use_sudo = needs_sudo(opts);
 
+    let cmd_display = if use_sudo {
+        format!("sudo nmap {}", args.join(" "))
+    } else {
+        format!("nmap {}", args.join(" "))
+    };
+    tracing::info!(
+        cmd = %cmd_display,
+        "nmap discovery: executing (this is typically the slowest stage on a /24)"
+    );
+    let started = std::time::Instant::now();
+
     let output = if use_sudo {
         Command::new("sudo")
             .arg("nmap")
@@ -49,8 +60,29 @@ pub async fn run_nmap_discovery(target: &str, opts: &ScanOptions) -> Result<Scan
             .await?
     };
 
+    tracing::debug!(
+        exit = ?output.status.code(),
+        stdout_bytes = output.stdout.len(),
+        stderr_bytes = output.stderr.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "nmap discovery: command finished"
+    );
+    if !output.status.success() {
+        tracing::warn!(
+            "nmap discovery exited with {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_nmap_xml(&stdout, false)
+    let result = parse_nmap_xml(&stdout, false)?;
+    tracing::info!(
+        hosts = result.hosts.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "nmap discovery: parsed XML"
+    );
+    Ok(result)
 }
 
 pub async fn run_nmap_fingerprint_all(
@@ -59,9 +91,22 @@ pub async fn run_nmap_fingerprint_all(
 ) -> Result<ScanResult> {
     let mut join_set = JoinSet::new();
     let mut all_hosts = Vec::new();
+    let total = hosts.len();
+    let batches = hosts.chunks(opts.max_parallel).count();
+    let mut completed: usize = 0;
 
     // Process in batches to respect max_parallel
-    for chunk in hosts.chunks(opts.max_parallel) {
+    for (batch_idx, chunk) in hosts.chunks(opts.max_parallel).enumerate() {
+        tracing::info!(
+            batch = batch_idx + 1,
+            batches,
+            batch_size = chunk.len(),
+            completed,
+            total,
+            "nmap fingerprint: starting batch"
+        );
+        let batch_start = std::time::Instant::now();
+
         for &ip in chunk {
             let use_sudo = needs_sudo(opts);
             let port_range = opts.port_range.clone();
@@ -83,7 +128,17 @@ pub async fn run_nmap_fingerprint_all(
                     tracing::warn!("nmap fingerprint task panicked: {}", e);
                 }
             }
+            completed += 1;
         }
+
+        tracing::info!(
+            batch = batch_idx + 1,
+            batches,
+            completed,
+            total,
+            elapsed_ms = batch_start.elapsed().as_millis() as u64,
+            "nmap fingerprint: batch done"
+        );
     }
 
     Ok(ScanResult {
@@ -114,6 +169,14 @@ async fn run_nmap_fingerprint_single(
     args.push("-oX");
     args.push("-");
 
+    let cmd_display = if sudo {
+        format!("sudo nmap {}", args.join(" "))
+    } else {
+        format!("nmap {}", args.join(" "))
+    };
+    tracing::info!(host = %ip, cmd = %cmd_display, "nmap fingerprint: executing");
+    let started = std::time::Instant::now();
+
     let output = if sudo {
         Command::new("sudo")
             .arg("nmap")
@@ -126,6 +189,19 @@ async fn run_nmap_fingerprint_single(
             .output()
             .await?
     };
+
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    if !output.status.success() {
+        tracing::warn!(
+            host = %ip,
+            exit = ?output.status.code(),
+            elapsed_ms,
+            "nmap fingerprint exited non-zero: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    } else {
+        tracing::info!(host = %ip, elapsed_ms, "nmap fingerprint: command finished");
+    }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     parse_nmap_xml(&stdout, true)

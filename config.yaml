@@ -1,0 +1,252 @@
+title: Homelab Dashboard
+network:
+  subnet: 192.168.2.0/24
+  gateway: 192.168.2.1
+  dns: 192.168.2.123
+  upstream_gateway: 192.168.100.1
+  upstream_ssid: OCHOA_GOMEZ_2.4
+  domain: lan
+
+devices:
+  - name: Archer C20
+    role: Router
+    type: router
+    type_label: ROUTER
+    avatar: "📡"
+    integration: openwrt
+    ip: 192.168.2.1
+    upstream_ip: 192.168.100.12
+    hostname: router.lan
+    icon: assets/tp-link.svg
+    ssh: true
+    os: OpenWrt 23.05
+    web: http://openwrt.lan/cgi-bin/luci/
+    specs:
+      Modelo: TP-Link Archer C20 v5
+      Tipo: Router Wi-Fi AC750
+      OS: OpenWrt 23.05
+      Kernel: Linux 5.15 (mipsel)
+      SoC: MediaTek MT7628N
+      CPU: MIPS 24Kc @ 580 MHz
+      RAM: 64 MiB
+      Flash: 8 MiB
+      WiFi driver: mt76
+      Red: "br-lan (LAN 192.168.2.1), wlan0 (WAN STA → OCHOA_GOMEZ_2.4), wlan1"
+      Modo: NAT repeater (WAN wlan0 → upstream ISP)
+      LAN IP: 192.168.2.1/24
+      WAN IP: 192.168.100.12
+      DHCP: activo en br-lan, opción 6 → 192.168.2.123 (Pi-hole)
+      SSH: Dropbear (solo RSA)
+    ports: [22, 53, 80]
+    port_map:
+      - port: 22
+        service: Dropbear SSH
+        proto: tcp
+      - port: 53
+        service: dnsmasq (DNS/DHCP)
+        proto: tcp/udp
+      - port: 80
+        service: LuCI Web
+        proto: http
+    services:
+      - name: dnsmasq
+        status: active
+      - name: dropbear
+        status: active
+      - name: firewall (nftables)
+        status: active
+      - name: odhcpd
+        status: active
+      - name: uhttpd (LuCI)
+        status: active
+      - name: rpcd
+        status: active
+
+  - name: mainframe
+    role: Server
+    type: server-x86
+    type_label: SERVER
+    avatar: "🖥️"
+    ip: 192.168.2.125
+    hostname: mainframe.lan
+    mac: "f0:2f:74:1e:df:ef"
+    icon: assets/mainframeIcon.png
+    ssh: true
+    specs:
+      OS: Arch Linux (rolling)
+      Kernel: Linux 6.19.8-arch1-1 x86_64
+      Placa base: ASUS PRIME A320M-K
+      CPU: AMD Ryzen 3 3200G (4C/4T) @ 3.6 GHz
+      GPU: Radeon Vega (integrada)
+      RAM: 5.7 GiB
+      Swap: 2.9 GiB (zram)
+      Almacenamiento: "~1.7 TB (4 discos)"
+      Red: enp5s0 (IP estática vía systemd-networkd)
+      MAC: "f0:2f:74:1e:df:ef"
+      DNS: 192.168.2.123 (Pi-hole, sin fallback)
+      SSH: OpenSSH 10.2
+      WoL: gestionado vía PiKVM (orangepizero3)
+    ports: [22, 11434]
+    port_map:
+      - port: 22
+        service: sshd
+        proto: tcp
+      - port: 11434
+        service: Ollama API
+        proto: http
+    docker:
+      - name: media-monitor-ollama
+        image: ollama/ollama:latest
+        status: healthy
+        info: "deepseek-r1:1.5b"
+    services:
+      - name: ollama
+        status: active
+      - name: docker
+        status: active
+      - name: sshd
+        status: active
+      - name: systemd-networkd
+        status: active
+      - name: systemd-resolved
+        status: active
+      - name: iwd
+        status: active
+      - name: containerd
+        status: active
+    links:
+      - label: Ollama API (local)
+        url: "http://192.168.2.125:11434"
+
+  - name: orangepizero3
+    role: Server
+    type: server-arm
+    type_label: SERVER
+    avatar: "🍊"
+    ip: 192.168.2.123
+    hostname: orangepi.lan
+    mac: "aa:02:d3:ed:0b:61"
+    icon: assets/merameranomi.svg
+    ssh: true
+    specs:
+      OS: Armbian 26.2.0 (Debian 13 Trixie)
+      Kernel: Linux 6.12.74-current-sunxi64 aarch64
+      CPU: ARM Cortex-A53 (4C) @ 1.416 GHz
+      RAM: 3.8 GiB
+      Swap: 1.9 GiB (zram)
+      Almacenamiento: 115 GB (microSD)
+      Red: br0 (Netplan, IP estática 192.168.2.123)
+      MAC: "aa:02:d3:ed:0b:61"
+      Roles: DNS + Ad-blocking (Pi-hole), KVM-over-IP (PiKVM)
+      SSH: OpenSSH 10.0p2
+    ports: [22, 53, 80, 81, 443, 1010, 8080, 8443, 8888, 9090]
+    port_map:
+      - port: 22
+        service: sshd
+        proto: tcp
+      - port: 53
+        service: Pi-hole DNS
+        proto: tcp/udp
+      - port: 80
+        service: NPM HTTP
+        proto: http
+      - port: 81
+        service: NPM Admin
+        proto: http
+      - port: 443
+        service: NPM HTTPS
+        proto: https
+      - port: 1010
+        service: Homelab Dashboard
+        proto: http
+      - port: 8080
+        service: Pi-hole Web
+        proto: http
+      - port: 8443
+        service: Pi-hole HTTPS
+        proto: https
+      - port: 8888
+        service: kvmd-nginx redirect
+        proto: http
+      - port: 9090
+        service: PiKVM
+        proto: https
+    docker:
+      - name: pihole
+        image: pihole/pihole:latest
+        status: healthy
+        info: "DNS + Ad-blocking, conditional forwarding → 192.168.2.1 (.lan)"
+      - name: npm
+        image: jc21/nginx-proxy-manager:latest
+        status: healthy
+        info: "Reverse proxy LAN (80/443) + Admin UI (81)"
+      - name: homelab-dashboard
+        image: homelab-dashboard-dashboard
+        status: healthy
+        info: "Este dashboard (puerto 1010)"
+    services:
+      - name: kvmd (PiKVM)
+        status: active
+      - name: kvmd-janus
+        status: active
+      - name: kvmd-webterm
+        status: active
+      - name: kvmd-nginx
+        status: active
+      - name: docker
+        status: active
+      - name: sshd
+        status: active
+      - name: dnsmasq
+        status: active
+      - name: bluetooth
+        status: active
+      - name: nfs-blkmap
+        status: active
+    links:
+      - label: PiKVM
+        url: "http://pikvm.lan/"
+      - label: Pi-hole
+        url: "http://pihole.lan/admin"
+      - label: Nginx Proxy Manager
+        url: "http://nginxpm.lan/"
+      - label: Dashboard
+        url: "http://dashboard.lan/"
+
+  - name: chimborazo
+    role: Server
+    type: legacy
+    type_label: SERVER
+    avatar: "🏔️"
+    ip: 192.168.2.124
+    hostname: chimborazo.lan
+    aliases:
+      - alpine-chimborazo.lan
+    mac: "00:c0:42:03:22:9e"
+    icon: assets/chimborazo.png
+    ssh: true
+    specs:
+      OS: Alpine Linux v3.19
+      Kernel: Linux 6.6.28-0-lts i686 (32-bit)
+      Placa base: i852GM-W627HF
+      CPU: Intel Pentium M (1C) @ 1.6 GHz
+      RAM: 456 MiB
+      Swap: 900 MiB
+      Almacenamiento: "18.6 GB (1 disco)"
+      Red: eth0 (ifupdown, IP estática 192.168.2.124)
+      MAC: "00:c0:42:03:22:9e"
+      SSH: OpenSSH 9.6
+    ports: [22]
+    port_map:
+      - port: 22
+        service: sshd
+        proto: tcp
+    services:
+      - name: sshd
+        status: active
+      - name: chronyd
+        status: active
+      - name: crond
+        status: active
+      - name: acpid
+        status: active

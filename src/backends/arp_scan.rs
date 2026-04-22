@@ -24,7 +24,11 @@ impl ScanBackend for ArpScanBackend {
     }
 
     async fn scan(&self, _target: &str, opts: &ScanOptions) -> Result<ScanResult> {
-        let mut cmd = if needs_sudo(opts) {
+        let use_sudo = needs_sudo(opts);
+        let cmd_display = if use_sudo { "sudo arp-scan -l" } else { "arp-scan -l" };
+        tracing::info!(cmd = cmd_display, "arp-scan: executing (scans LOCAL interface subnet, not CLI target)");
+
+        let mut cmd = if use_sudo {
             let mut c = Command::new("sudo");
             c.args(["arp-scan", "-l"]);
             c
@@ -35,8 +39,23 @@ impl ScanBackend for ArpScanBackend {
         };
 
         let output = cmd.output().await?;
+        tracing::debug!(
+            exit = ?output.status.code(),
+            stdout_bytes = output.stdout.len(),
+            stderr_bytes = output.stderr.len(),
+            "arp-scan: command finished"
+        );
+        if !output.status.success() {
+            tracing::warn!(
+                "arp-scan exited with {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
         let stdout = String::from_utf8_lossy(&output.stdout);
         let hosts = parse_arp_scan_output(&stdout);
+        tracing::info!(hosts = hosts.len(), "arp-scan: parsed responses");
 
         Ok(ScanResult {
             hosts,
