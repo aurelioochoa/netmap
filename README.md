@@ -44,6 +44,10 @@ Run `make` on its own to see every available command.
 
 ## Desktop GUI
 
+<p align="center">
+  <img src="assets/gui.webp" alt="netmap-gui: target bar, host list, topology canvas, and details pane" width="100%">
+</p>
+
 ```bash
 make gui            # run it
 make install-gui    # or install it to /usr/local/bin
