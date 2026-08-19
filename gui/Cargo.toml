@@ -1,0 +1,23 @@
+[package]
+name = "netmap-gui"
+description = "Desktop GUI for netmap — interactive network topology mapper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "netmap-gui"
+path = "src/main.rs"
+
+[dependencies]
+netmap = { path = ".." }
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde_json = "1"
+eframe = "0.35.0"
+egui = "0.35.0"
+rfd = "0.17.2"

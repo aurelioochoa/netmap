@@ -1,10 +1,19 @@
-[package]
-name = "netmap"
-description = "CLI tool that discovers and renders a network topology map in the terminal"
+[workspace]
+members = [".", "gui"]
+
+[workspace.package]
 version = "0.2.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/aurelioochoa/netmap"
+
+[package]
+name = "netmap"
+description = "CLI tool that discovers and renders a network topology map in the terminal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [lib]
 name = "netmap"
