@@ -186,4 +186,4 @@ scanner binary it cannot find.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
