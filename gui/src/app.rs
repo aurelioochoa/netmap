@@ -56,24 +56,29 @@ pub struct NetmapApp {
     pub needs_fit: bool,
 
     running: Option<RunningScan>,
-    rt: tokio::runtime::Runtime,
+    /// Built on first use. Constructing a multi-threaded runtime costs real
+    /// threads, and a test that only exercises state should not pay for one.
+    rt: Option<tokio::runtime::Runtime>,
 }
 
 impl NetmapApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         // Seed the form from the config file so the GUI and CLI agree on defaults.
-        let cfg = Config::load().unwrap_or_default();
+        Self::from_config(Config::load().unwrap_or_default())
+    }
+
+    /// Builds the app from an explicit config, with no eframe context required.
+    ///
+    /// `new` needs a `CreationContext` to satisfy eframe, but nothing in the app
+    /// actually uses it — splitting it out is what lets tests construct a real
+    /// app rather than a stand-in that could drift from the shipped one.
+    pub fn from_config(cfg: Config) -> Self {
         let opts = cfg.to_scan_options().unwrap_or_default();
 
         let mut backends = [true; 4];
         for (i, kind) in BackendKind::ALL.iter().enumerate() {
             backends[i] = !opts.skip_backends.contains(kind);
         }
-
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("failed to start the tokio runtime");
 
         let mut app = Self {
             target: cfg.target.clone().unwrap_or_default(),
@@ -97,7 +102,7 @@ impl NetmapApp {
             zoom: 1.0,
             needs_fit: true,
             running: None,
-            rt,
+            rt: None,
         };
         app.push_log("Ready. Enter a target and press Scan.");
         app
@@ -165,7 +170,13 @@ impl NetmapApp {
         }
 
         let opts = self.scan_options();
-        self.running = Some(scan::spawn(&self.rt, target, opts, ctx.clone()));
+        let rt = self.rt.get_or_insert_with(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to start the tokio runtime")
+        });
+        self.running = Some(scan::spawn(rt, target, opts, ctx.clone()));
     }
 
     pub fn cancel_scan(&mut self) {
@@ -342,5 +353,393 @@ impl eframe::App for NetmapApp {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(200));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use netmap::model::{HopEdge, Host, Port, Protocol};
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn app() -> NetmapApp {
+        NetmapApp::from_config(Config::default())
+    }
+
+    // --- form -> ScanOptions ---
+
+    #[test]
+    fn unchecked_backends_become_skip_entries() {
+        let mut a = app();
+        a.backends = [true, false, true, false]; // ip-neigh, arp-scan, nmap, traceroute
+
+        let opts = a.scan_options();
+
+        assert_eq!(
+            opts.skip_backends,
+            vec![BackendKind::ArpScan, BackendKind::Traceroute],
+            "only the unchecked backends should be skipped"
+        );
+    }
+
+    #[test]
+    fn form_fields_map_onto_scan_options() {
+        let mut a = app();
+        a.sudo = true;
+        a.ports = "  1-1024  ".into();
+        a.timeout = 42;
+        a.max_parallel = 7;
+        a.show_off_target = true;
+
+        let opts = a.scan_options();
+
+        assert!(opts.sudo);
+        assert_eq!(opts.port_range, "1-1024", "whitespace should be trimmed");
+        assert_eq!(opts.timeout_secs, 42);
+        assert_eq!(opts.max_parallel, 7);
+        assert!(opts.show_off_target);
+    }
+
+    #[test]
+    fn max_parallel_is_clamped_so_the_semaphore_cannot_deadlock() {
+        let mut a = app();
+        a.max_parallel = 0;
+        assert_eq!(a.scan_options().max_parallel, 1);
+    }
+
+    #[test]
+    fn the_gui_never_sets_a_stage_timeout() {
+        // The GUI has an explicit Cancel button; a second, time-based way for a
+        // scan to stop would only make its behaviour less predictable.
+        assert_eq!(app().scan_options().stage_timeout_secs, 0);
+    }
+
+    #[test]
+    fn config_file_values_seed_the_form() {
+        let cfg = Config::parse(
+            r#"
+            target = "10.1.2.0/24"
+            sudo = true
+            timeout = 15
+            max-parallel = 4
+            skip = ["nmap"]
+            "#,
+        )
+        .unwrap();
+
+        let a = NetmapApp::from_config(cfg);
+
+        assert_eq!(a.target, "10.1.2.0/24");
+        assert!(a.sudo);
+        assert_eq!(a.timeout, 15);
+        assert_eq!(a.max_parallel, 4);
+        assert_eq!(
+            a.backends,
+            [true, true, false, true],
+            "a skipped backend should start unchecked"
+        );
+    }
+
+    // --- host list filtering ---
+
+    #[test]
+    fn the_filter_matches_ip_hostname_vendor_and_role() {
+        let mut a = app();
+        let mut h1 = Host::new(ip("192.168.1.10"));
+        h1.hostname = Some("fileserver".into());
+        h1.vendor = Some("Ubiquiti Inc".into());
+        h1.role = netmap::model::DeviceRole::Server;
+
+        let mut h2 = Host::new(ip("192.168.1.99"));
+        h2.role = netmap::model::DeviceRole::Workstation;
+
+        a.graph.hosts.insert(h1.ip, h1);
+        a.graph.hosts.insert(h2.ip, h2);
+
+        assert_eq!(
+            a.visible_hosts().len(),
+            2,
+            "an empty filter shows everything"
+        );
+
+        for needle in ["fileserver", "UBIQUITI", "server", ".10"] {
+            a.filter = needle.into();
+            let visible = a.visible_hosts();
+            assert_eq!(
+                visible,
+                vec![ip("192.168.1.10")],
+                "filter {:?} failed",
+                needle
+            );
+        }
+
+        a.filter = "nonexistent".into();
+        assert!(a.visible_hosts().is_empty());
+    }
+
+    #[test]
+    fn the_host_list_is_ordered_numerically_not_lexically() {
+        let mut a = app();
+        for addr in ["192.168.1.100", "192.168.1.9", "192.168.1.20"] {
+            a.graph.hosts.insert(ip(addr), Host::new(ip(addr)));
+        }
+
+        assert_eq!(
+            a.visible_hosts(),
+            vec![ip("192.168.1.9"), ip("192.168.1.20"), ip("192.168.1.100")],
+            "string ordering would put .100 before .20"
+        );
+    }
+
+    // --- synthetic topology detection ---
+
+    #[test]
+    fn a_star_around_the_gateway_is_reported_as_inferred() {
+        let mut a = app();
+        let gw = ip("10.0.0.1");
+        a.graph.gateway = Some(gw);
+        for last in [2u8, 3, 4] {
+            let h = ip(&format!("10.0.0.{last}"));
+            a.graph.hosts.insert(h, Host::new(h));
+            a.graph.edges.push(HopEdge {
+                from: gw,
+                to: h,
+                hop_index: 1,
+            });
+        }
+        a.graph.hosts.insert(gw, Host::new(gw));
+
+        assert!(
+            a.topology_is_synthetic(),
+            "every edge is hop 1 from the gateway"
+        );
+    }
+
+    #[test]
+    fn a_measured_multi_hop_topology_is_not_flagged_as_inferred() {
+        let mut a = app();
+        let gw = ip("10.0.0.1");
+        a.graph.gateway = Some(gw);
+        for addr in ["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"] {
+            a.graph.hosts.insert(ip(addr), Host::new(ip(addr)));
+        }
+        a.graph.edges.push(HopEdge {
+            from: gw,
+            to: ip("10.0.0.2"),
+            hop_index: 1,
+        });
+        // A second hop means traceroute actually measured depth.
+        a.graph.edges.push(HopEdge {
+            from: ip("10.0.0.2"),
+            to: ip("10.0.0.3"),
+            hop_index: 2,
+        });
+
+        assert!(!a.topology_is_synthetic());
+    }
+
+    // --- event pump ---
+
+    /// Drives `pump_events` with a scripted event stream, standing in for a
+    /// running scan without touching the network.
+    fn pump(a: &mut NetmapApp, events: Vec<ScanEvent>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for e in events {
+            tx.send(e).unwrap();
+        }
+        drop(tx);
+        a.running = Some(crate::scan::RunningScan {
+            events: rx,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            started: std::time::Instant::now(),
+        });
+        a.phase = Phase::Scanning;
+        a.pump_events();
+    }
+
+    #[test]
+    fn discovered_hosts_appear_incrementally() {
+        let mut a = app();
+        pump(
+            &mut a,
+            vec![
+                ScanEvent::HostDiscovered(Box::new(Host::new(ip("10.0.0.5")))),
+                ScanEvent::HostDiscovered(Box::new(Host::new(ip("10.0.0.6")))),
+            ],
+        );
+
+        assert_eq!(
+            a.graph.hosts.len(),
+            2,
+            "hosts should land before Complete arrives"
+        );
+    }
+
+    #[test]
+    fn a_host_update_replaces_rather_than_duplicates() {
+        let mut a = app();
+        let mut updated = Host::new(ip("10.0.0.5"));
+        updated.open_ports.push(Port {
+            number: 22,
+            protocol: Protocol::Tcp,
+            service: Some("ssh".into()),
+        });
+
+        pump(
+            &mut a,
+            vec![
+                ScanEvent::HostDiscovered(Box::new(Host::new(ip("10.0.0.5")))),
+                ScanEvent::HostUpdated(Box::new(updated)),
+            ],
+        );
+
+        assert_eq!(a.graph.hosts.len(), 1);
+        assert_eq!(a.graph.hosts[&ip("10.0.0.5")].open_ports.len(), 1);
+    }
+
+    #[test]
+    fn the_complete_event_replaces_the_incremental_graph() {
+        // Only the final graph is CIDR-filtered, gateway-resolved and
+        // role-annotated, so merging into it would resurrect filtered hosts.
+        let mut a = app();
+        let mut final_graph = HostGraph::empty();
+        final_graph
+            .hosts
+            .insert(ip("10.0.0.9"), Host::new(ip("10.0.0.9")));
+
+        pump(
+            &mut a,
+            vec![
+                ScanEvent::HostDiscovered(Box::new(Host::new(ip("172.17.0.1")))),
+                ScanEvent::Complete(Box::new(final_graph)),
+            ],
+        );
+
+        assert_eq!(a.phase, Phase::Done);
+        assert_eq!(a.graph.hosts.len(), 1);
+        assert!(
+            a.graph.hosts.contains_key(&ip("10.0.0.9")),
+            "the off-target host should be gone, not merged back in"
+        );
+        assert!(
+            a.elapsed.is_some(),
+            "a finished scan should report its duration"
+        );
+    }
+
+    #[test]
+    fn cancellation_is_reported_without_claiming_completion() {
+        let mut a = app();
+        pump(&mut a, vec![ScanEvent::Cancelled]);
+
+        assert_eq!(a.phase, Phase::Cancelled);
+        assert!(a.elapsed.is_some());
+        assert!(
+            a.log.iter().any(|l| l.to_lowercase().contains("cancel")),
+            "the user should be told the results are partial"
+        );
+    }
+
+    #[test]
+    fn warnings_reach_the_log() {
+        let mut a = app();
+        pump(
+            &mut a,
+            vec![ScanEvent::Warning("arp-scan needs root".into())],
+        );
+        assert!(a.log.iter().any(|l| l.contains("arp-scan needs root")));
+    }
+
+    #[test]
+    fn per_host_progress_is_tracked_and_cleared_when_a_stage_ends() {
+        let mut a = app();
+        pump(
+            &mut a,
+            vec![ScanEvent::HostProgress {
+                kind: BackendKind::Nmap,
+                done: 3,
+                total: 10,
+            }],
+        );
+        assert_eq!(a.progress, Some((3, 10)));
+
+        pump(
+            &mut a,
+            vec![ScanEvent::StageFinished {
+                kind: BackendKind::Nmap,
+                elapsed_ms: 120,
+                found: 3,
+            }],
+        );
+        assert_eq!(a.progress, None, "a finished stage should clear the bar");
+    }
+
+    #[test]
+    fn a_scan_that_dies_without_a_final_event_still_leaves_scanning_state() {
+        // The channel closing is the only signal that a failed scan has ended.
+        let mut a = app();
+        pump(&mut a, vec![]);
+
+        assert_ne!(a.phase, Phase::Scanning, "the UI must not spin forever");
+        assert!(a.running.is_none());
+    }
+
+    // --- misc state ---
+
+    #[test]
+    fn the_log_is_bounded() {
+        let mut a = app();
+        for i in 0..(LOG_CAPACITY + 50) {
+            a.push_log(format!("line {i}"));
+        }
+        assert_eq!(
+            a.log.len(),
+            LOG_CAPACITY,
+            "a long scan must not grow without limit"
+        );
+        assert!(
+            a.log
+                .back()
+                .unwrap()
+                .contains(&format!("line {}", LOG_CAPACITY + 49)),
+            "the newest line should survive"
+        );
+    }
+
+    #[test]
+    fn relayout_forgets_pins_for_hosts_that_are_gone() {
+        let mut a = app();
+        a.graph
+            .hosts
+            .insert(ip("10.0.0.1"), Host::new(ip("10.0.0.1")));
+        a.pinned.insert(ip("10.0.0.1"), egui::Pos2::new(1.0, 2.0));
+        a.pinned.insert(ip("10.0.0.99"), egui::Pos2::new(3.0, 4.0));
+
+        a.relayout();
+
+        assert!(a.pinned.contains_key(&ip("10.0.0.1")));
+        assert!(
+            !a.pinned.contains_key(&ip("10.0.0.99")),
+            "a pin for a vanished host would leak forever"
+        );
+    }
+
+    #[test]
+    fn scanning_with_an_empty_target_is_refused() {
+        let mut a = app();
+        a.target = "   ".into();
+        let ctx = egui::Context::default();
+
+        a.start_scan(&ctx);
+
+        assert_eq!(
+            a.phase,
+            Phase::Idle,
+            "an empty target must not start a scan"
+        );
+        assert!(a.log.iter().any(|l| l.contains("no target")));
     }
 }

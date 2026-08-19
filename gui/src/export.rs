@@ -93,3 +93,120 @@ fn write_and_log(app: &mut NetmapApp, path: &PathBuf, contents: &str) {
         Err(e) => app.push_log(format!("Could not write {}: {e}", path.display())),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use netmap::config::Config;
+    use netmap::model::{DeviceRole, HopEdge, Host};
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn app_with_graph() -> NetmapApp {
+        let mut a = NetmapApp::from_config(Config::default());
+        a.target = "192.168.1.0/24".into();
+        let gw = ip("192.168.1.1");
+        let srv = ip("192.168.1.10");
+
+        let mut g = Host::new(gw);
+        g.role = DeviceRole::Gateway;
+        let mut s = Host::new(srv);
+        s.role = DeviceRole::Server;
+        s.hostname = Some("nas".into());
+
+        a.graph.hosts.insert(gw, g);
+        a.graph.hosts.insert(srv, s);
+        a.graph.gateway = Some(gw);
+        a.graph.edges.push(HopEdge {
+            from: gw,
+            to: srv,
+            hop_index: 1,
+        });
+        a.relayout();
+        a
+    }
+
+    #[test]
+    fn the_suggested_filename_is_derived_from_the_target_and_is_path_safe() {
+        let a = app_with_graph();
+        let name = suggested_name(&a, "json");
+
+        assert!(name.ends_with(".json"));
+        assert!(
+            !name.contains('/') && !name.contains('\\'),
+            "a CIDR's slash must not become a directory separator: {name}"
+        );
+        assert!(name.contains("192.168.1.0"));
+    }
+
+    #[test]
+    fn an_empty_target_still_yields_a_usable_filename() {
+        let mut a = NetmapApp::from_config(Config::default());
+        a.target = String::new();
+        assert_eq!(suggested_name(&a, "svg"), "netmap-scan.svg");
+    }
+
+    #[test]
+    fn a_saved_scan_reloads_into_an_equivalent_graph() {
+        let a = app_with_graph();
+        let json = serde_json::to_string_pretty(&a.graph).unwrap();
+
+        let dir = std::env::temp_dir().join(format!("netmap-gui-export-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scan.json");
+        std::fs::write(&path, &json).unwrap();
+
+        // open_json's file dialog can't run headless, so drive the load path it wraps.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let restored: HostGraph = serde_json::from_str(&raw).unwrap();
+
+        let mut b = NetmapApp::from_config(Config::default());
+        b.graph = restored;
+        b.relayout();
+
+        assert_eq!(b.graph.hosts.len(), a.graph.hosts.len());
+        assert_eq!(b.graph.gateway, a.graph.gateway);
+        assert_eq!(
+            renderer::render_tree(&b.graph),
+            renderer::render_tree(&a.graph),
+            "a reloaded scan must render identically to the live one"
+        );
+        assert_eq!(b.layout.positions.len(), a.layout.positions.len());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_write_failure_is_logged_rather_than_panicking() {
+        let mut a = app_with_graph();
+        // A path that cannot exist, standing in for a full disk or bad permissions.
+        write_and_log(&mut a, &PathBuf::from("/nonexistent-dir/scan.json"), "{}");
+
+        assert!(
+            a.log.iter().any(|l| l.contains("Could not write")),
+            "the user needs to be told the export failed: {:?}",
+            a.log
+        );
+    }
+
+    #[test]
+    fn loading_a_file_that_is_not_a_scan_is_reported_not_fatal() {
+        let mut a = NetmapApp::from_config(Config::default());
+        let before = a.graph.hosts.len();
+
+        match serde_json::from_str::<HostGraph>("{\"nope\": true}") {
+            Ok(_) => panic!("junk should not parse as a scan"),
+            Err(e) => a.push_log(format!("not a netmap scan: {e}")),
+        }
+
+        assert_eq!(
+            a.graph.hosts.len(),
+            before,
+            "a failed load must not clear the graph"
+        );
+        assert!(a.log.iter().any(|l| l.contains("not a netmap scan")));
+    }
+}

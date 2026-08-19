@@ -330,3 +330,184 @@ fn draw_overlays(app: &NetmapApp, ui: &egui::Ui, viewport: Rect, painter: &egui:
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use netmap::model::{Port, Protocol};
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn host_with_ports(nums: &[u16]) -> Host {
+        let mut h = Host::new(ip("10.0.0.2"));
+        for n in nums {
+            h.open_ports.push(Port {
+                number: *n,
+                protocol: Protocol::Tcp,
+                service: None,
+            });
+        }
+        h
+    }
+
+    #[test]
+    fn every_role_has_a_distinct_colour() {
+        let roles = [
+            DeviceRole::Gateway,
+            DeviceRole::Switch,
+            DeviceRole::WirelessAP,
+            DeviceRole::Server,
+            DeviceRole::Workstation,
+            DeviceRole::IoT,
+            DeviceRole::Unknown,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for r in roles {
+            assert!(
+                seen.insert(role_color(r).to_array()),
+                "{r} reuses another role's colour, making the legend ambiguous"
+            );
+        }
+    }
+
+    #[test]
+    fn the_canvas_and_svg_exporter_agree_on_role_colours() {
+        // Divergence here would mean an exported diagram looks different from
+        // the one the user was just looking at.
+        for (role, hex) in [
+            (DeviceRole::Gateway, "#e05252"),
+            (DeviceRole::Server, "#4f9d5b"),
+            (DeviceRole::Workstation, "#6b74d6"),
+            (DeviceRole::Unknown, "#8a8f98"),
+        ] {
+            let c = role_color(role);
+            let expected = (
+                u8::from_str_radix(&hex[1..3], 16).unwrap(),
+                u8::from_str_radix(&hex[3..5], 16).unwrap(),
+                u8::from_str_radix(&hex[5..7], 16).unwrap(),
+            );
+            assert_eq!(
+                (c.r(), c.g(), c.b()),
+                expected,
+                "{role} drifted from the SVG palette"
+            );
+        }
+    }
+
+    #[test]
+    fn port_summary_truncates_so_a_busy_host_stays_readable() {
+        assert_eq!(port_summary(&host_with_ports(&[22])).unwrap(), ":22");
+        assert_eq!(
+            port_summary(&host_with_ports(&[443, 22, 80])).unwrap(),
+            ":22 :80 :443",
+            "ports should be sorted"
+        );
+        assert_eq!(
+            port_summary(&host_with_ports(&[22, 80, 443, 8080, 9090])).unwrap(),
+            ":22 :80 :443 +2"
+        );
+        assert!(port_summary(&host_with_ports(&[])).is_none());
+    }
+
+    #[test]
+    fn duplicate_ports_are_collapsed() {
+        assert_eq!(
+            port_summary(&host_with_ports(&[80, 80, 443])).unwrap(),
+            ":80 :443"
+        );
+    }
+
+    #[test]
+    fn a_tooltip_shows_only_the_fields_that_are_known() {
+        let bare = tooltip_text(&Host::new(ip("10.0.0.7")));
+        assert!(bare.contains("10.0.0.7"));
+        assert!(
+            !bare.contains("mac:"),
+            "absent fields should not render as empty rows"
+        );
+
+        let mut rich = Host::new(ip("10.0.0.8"));
+        rich.hostname = Some("nas".into());
+        rich.mac = Some("aa:bb:cc:dd:ee:ff".into());
+        rich.vendor = Some("Synology".into());
+        rich.os_guess = Some("Linux 5.x".into());
+        rich.open_ports.push(Port {
+            number: 5000,
+            protocol: Protocol::Tcp,
+            service: Some("http".into()),
+        });
+
+        let text = tooltip_text(&rich);
+        for expected in [
+            "nas",
+            "aa:bb:cc:dd:ee:ff",
+            "Synology",
+            "Linux 5.x",
+            "5000/http",
+        ] {
+            assert!(
+                text.contains(expected),
+                "tooltip missing {expected}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn fit_to_view_frames_the_graph_without_exceeding_one_to_one() {
+        let mut app = NetmapApp::from_config(netmap::config::Config::default());
+        let gw = ip("10.0.0.1");
+        app.graph.gateway = Some(gw);
+        app.graph.hosts.insert(gw, Host::new(gw));
+        for last in 2u8..12 {
+            let h = ip(&format!("10.0.0.{last}"));
+            app.graph.hosts.insert(h, Host::new(h));
+            app.graph.edges.push(netmap::model::HopEdge {
+                from: gw,
+                to: h,
+                hop_index: 1,
+            });
+        }
+        app.relayout();
+
+        let viewport = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        fit_to_view(&mut app, viewport);
+
+        assert!(
+            app.zoom > 0.0 && app.zoom <= 1.0,
+            "zoom {} out of range",
+            app.zoom
+        );
+        assert!(
+            app.layout.width * app.zoom <= viewport.width(),
+            "the laid-out graph should fit horizontally"
+        );
+    }
+
+    #[test]
+    fn fit_to_view_is_a_no_op_on_an_empty_graph() {
+        let mut app = NetmapApp::from_config(netmap::config::Config::default());
+        let before = app.zoom;
+        fit_to_view(
+            &mut app,
+            Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0)),
+        );
+        assert_eq!(app.zoom, before, "nothing to frame, nothing to change");
+    }
+
+    #[test]
+    fn a_dragged_node_overrides_its_computed_position() {
+        let mut app = NetmapApp::from_config(netmap::config::Config::default());
+        let a = ip("10.0.0.1");
+        app.graph.hosts.insert(a, Host::new(a));
+        app.relayout();
+
+        let computed = layout_pos(&app, a).expect("host should be laid out");
+        app.pinned
+            .insert(a, Pos2::new(computed.x + 500.0, computed.y + 250.0));
+
+        let pinned = layout_pos(&app, a).unwrap();
+        assert_eq!(pinned, Pos2::new(computed.x + 500.0, computed.y + 250.0));
+    }
+}

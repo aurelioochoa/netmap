@@ -136,6 +136,11 @@ make test
 make lint
 ```
 
+The GUI is tested too: `gui/` carries state and event-pump tests plus
+widget-interaction tests built on [`egui_kittest`](https://crates.io/crates/egui_kittest),
+which render the real panels and drive them through AccessKit. They need no GPU
+and no display, so they run in CI like any other test.
+
 The crate is split so the scanning logic is reusable:
 
 ```

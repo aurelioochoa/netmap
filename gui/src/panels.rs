@@ -284,3 +284,242 @@ pub fn details(app: &mut NetmapApp, ui: &mut egui::Ui) {
             });
         });
 }
+
+/// Widget-level tests: these render the real panels through `egui_kittest`
+/// and interact via AccessKit, so they exercise the actual widget tree rather
+/// than a re-description of it. No GPU or display is involved.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{NetmapApp, Phase};
+    use egui_kittest::kittest::Queryable;
+    use egui_kittest::Harness;
+    use netmap::config::Config;
+    use netmap::model::{DeviceRole, Host};
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// A harness rendering the top bar over a real `NetmapApp`.
+    fn top_bar_harness(app: NetmapApp) -> Harness<'static, NetmapApp> {
+        Harness::new_ui_state(|ui, app| top_bar(app, ui), app)
+    }
+
+    #[test]
+    fn the_top_bar_exposes_the_primary_controls() {
+        let mut h = top_bar_harness(NetmapApp::from_config(Config::default()));
+        h.run();
+
+        // Present and reachable by an assistive technology, not just painted.
+        assert!(h.query_by_label("Scan").is_some(), "no Scan button");
+        assert!(h.query_by_label("sudo").is_some(), "no sudo checkbox");
+        assert!(h.query_by_label("Fit").is_some(), "no Fit button");
+        assert!(h.query_by_label("Backends").is_some(), "no Backends menu");
+        assert!(h.query_by_label("Export").is_some(), "no Export menu");
+    }
+
+    #[test]
+    fn the_scan_button_becomes_cancel_while_a_scan_runs() {
+        let mut app = NetmapApp::from_config(Config::default());
+        app.phase = Phase::Scanning;
+
+        let mut h = top_bar_harness(app);
+        // A running scan shows a spinner, which repaints every frame by design,
+        // so `run()` would never see the UI settle.
+        h.run_steps(2);
+
+        assert!(
+            h.query_by_label("Cancel").is_some(),
+            "a running scan must offer a way to stop it"
+        );
+        assert!(
+            h.query_by_label("Scan").is_none(),
+            "Scan and Cancel must not both be offered"
+        );
+    }
+
+    #[test]
+    fn clicking_scan_with_an_empty_target_does_not_start_one() {
+        let mut h = top_bar_harness(NetmapApp::from_config(Config::default()));
+        h.run();
+
+        h.get_by_label("Scan").click();
+        h.run();
+
+        assert_eq!(h.state().phase, Phase::Idle);
+        assert!(
+            h.state().log.iter().any(|l| l.contains("no target")),
+            "the refusal should be explained, not silent"
+        );
+    }
+
+    #[test]
+    fn clicking_scan_with_a_target_starts_one() {
+        let mut app = NetmapApp::from_config(Config::default());
+        app.target = "192.168.1.0/24".into();
+        // Disable every backend so the spawned pipeline touches no network and
+        // returns immediately; this test is about the button being wired up.
+        app.backends = [false; 4];
+
+        let mut h = top_bar_harness(app);
+        h.run();
+        assert_eq!(h.state().phase, Phase::Idle);
+
+        h.get_by_label("Scan").click();
+        h.run_steps(2); // Spinner is now up; see the note above.
+
+        assert_eq!(
+            h.state().phase,
+            Phase::Scanning,
+            "clicking Scan should hand off to the pipeline"
+        );
+        assert!(h.state().log.iter().any(|l| l.contains("192.168.1.0/24")));
+
+        h.state_mut().cancel_scan();
+    }
+
+    #[test]
+    fn toggling_sudo_flows_through_to_scan_options() {
+        let mut h = top_bar_harness(NetmapApp::from_config(Config::default()));
+        h.run();
+        assert!(!h.state().scan_options().sudo);
+
+        h.get_by_label("sudo").click();
+        h.run();
+
+        assert!(
+            h.state().scan_options().sudo,
+            "the checkbox should drive the options the scan actually uses"
+        );
+    }
+
+    #[test]
+    fn fit_requests_a_refit_of_the_canvas() {
+        let mut app = NetmapApp::from_config(Config::default());
+        app.needs_fit = false;
+
+        let mut h = top_bar_harness(app);
+        h.run();
+        h.get_by_label("Fit").click();
+        h.run();
+
+        assert!(h.state().needs_fit);
+    }
+
+    #[test]
+    fn the_host_list_renders_discovered_hosts_and_honours_the_filter() {
+        let mut app = NetmapApp::from_config(Config::default());
+        for (addr, name) in [("192.168.1.10", "nas"), ("192.168.1.20", "printer")] {
+            let mut host = Host::new(ip(addr));
+            host.hostname = Some(name.into());
+            host.role = DeviceRole::Server;
+            app.graph.hosts.insert(host.ip, host);
+        }
+
+        let mut h = Harness::new_ui_state(|ui, app| host_list(app, ui), app);
+        h.run();
+
+        assert!(h.query_by_label_contains("192.168.1.10").is_some());
+        assert!(h.query_by_label_contains("192.168.1.20").is_some());
+        assert!(h.query_by_label_contains("Hosts (2)").is_some());
+
+        h.state_mut().filter = "printer".into();
+        h.run();
+
+        assert!(h.query_by_label_contains("192.168.1.20").is_some());
+        assert!(
+            h.query_by_label_contains("192.168.1.10").is_none(),
+            "the filter should hide non-matching hosts"
+        );
+    }
+
+    #[test]
+    fn clicking_a_host_in_the_list_selects_it() {
+        let mut app = NetmapApp::from_config(Config::default());
+        let addr = ip("192.168.1.42");
+        app.graph.hosts.insert(addr, Host::new(addr));
+
+        let mut h = Harness::new_ui_state(|ui, app| host_list(app, ui), app);
+        h.run();
+        assert_eq!(h.state().selected, None);
+
+        h.get_by_label_contains("192.168.1.42").click();
+        h.run();
+
+        assert_eq!(h.state().selected, Some(addr));
+    }
+
+    #[test]
+    fn an_empty_host_list_says_so_rather_than_rendering_blank() {
+        let mut app = NetmapApp::from_config(Config::default());
+        app.filter = "nothing matches this".into();
+        app.graph
+            .hosts
+            .insert(ip("10.0.0.1"), Host::new(ip("10.0.0.1")));
+
+        let mut h = Harness::new_ui_state(|ui, app| host_list(app, ui), app);
+        h.run();
+
+        assert!(h.query_by_label("No matching hosts").is_some());
+    }
+
+    #[test]
+    fn the_details_pane_shows_the_selected_hosts_fields() {
+        let mut app = NetmapApp::from_config(Config::default());
+        let addr = ip("192.168.1.10");
+        let mut host = Host::new(addr);
+        host.hostname = Some("fileserver".into());
+        host.mac = Some("aa:bb:cc:dd:ee:ff".into());
+        host.role = DeviceRole::Server;
+        app.graph.hosts.insert(addr, host);
+        app.selected = Some(addr);
+
+        let mut h = Harness::new_ui_state(|ui, app| details(app, ui), app);
+        h.run();
+
+        for expected in ["192.168.1.10", "fileserver", "aa:bb:cc:dd:ee:ff"] {
+            assert!(
+                h.query_by_label_contains(expected).is_some(),
+                "details pane missing {expected}"
+            );
+        }
+        // "server" appears both as the role and inside "fileserver", so count
+        // rather than demanding a unique match.
+        assert!(
+            h.query_all_by_label_contains("server").count() >= 2,
+            "expected both the role and the hostname to mention server"
+        );
+    }
+
+    #[test]
+    fn with_nothing_selected_the_details_pane_shows_the_log() {
+        let mut app = NetmapApp::from_config(Config::default());
+        app.push_log("a distinctive log line");
+
+        let mut h = Harness::new_ui_state(|ui, app| details(app, ui), app);
+        h.run();
+
+        assert!(h.query_by_label_contains("Select a host").is_some());
+        assert!(h
+            .query_by_label_contains("a distinctive log line")
+            .is_some());
+    }
+
+    #[test]
+    fn a_host_with_no_open_ports_says_so_explicitly() {
+        let mut app = NetmapApp::from_config(Config::default());
+        let addr = ip("10.0.0.3");
+        app.graph.hosts.insert(addr, Host::new(addr));
+        app.selected = Some(addr);
+
+        let mut h = Harness::new_ui_state(|ui, app| details(app, ui), app);
+        h.run();
+
+        assert!(
+            h.query_by_label_contains("(none found)").is_some(),
+            "an empty port list should be stated, not left ambiguous"
+        );
+    }
+}
