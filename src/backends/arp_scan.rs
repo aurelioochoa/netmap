@@ -1,15 +1,22 @@
+use super::{needs_sudo, run_with_limits, PartialHost, ScanBackend, ScanOptions, ScanResult};
 use crate::model::BackendKind;
-use super::{needs_sudo, PartialHost, ScanBackend, ScanOptions, ScanResult};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::net::IpAddr;
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 pub struct ArpScanBackend;
 
 impl ArpScanBackend {
     pub fn new() -> Self {
         Self
+    }
+}
+
+impl Default for ArpScanBackend {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -23,12 +30,24 @@ impl ScanBackend for ArpScanBackend {
         which::which("arp-scan").is_ok()
     }
 
-    async fn scan(&self, _target: &str, opts: &ScanOptions) -> Result<ScanResult> {
+    async fn scan(
+        &self,
+        _target: &str,
+        opts: &ScanOptions,
+        cancel: &CancellationToken,
+    ) -> Result<ScanResult> {
         let use_sudo = needs_sudo(opts);
-        let cmd_display = if use_sudo { "sudo arp-scan -l" } else { "arp-scan -l" };
-        tracing::info!(cmd = cmd_display, "arp-scan: executing (scans LOCAL interface subnet, not CLI target)");
+        let cmd_display = if use_sudo {
+            "sudo arp-scan -l"
+        } else {
+            "arp-scan -l"
+        };
+        tracing::info!(
+            cmd = cmd_display,
+            "arp-scan: executing (scans LOCAL interface subnet, not CLI target)"
+        );
 
-        let mut cmd = if use_sudo {
+        let cmd = if use_sudo {
             let mut c = Command::new("sudo");
             c.args(["arp-scan", "-l"]);
             c
@@ -38,7 +57,7 @@ impl ScanBackend for ArpScanBackend {
             c
         };
 
-        let output = cmd.output().await?;
+        let output = run_with_limits(cmd, opts.stage_timeout_secs, cancel, "arp-scan").await?;
         tracing::debug!(
             exit = ?output.status.code(),
             stdout_bytes = output.stdout.len(),
@@ -93,7 +112,11 @@ pub fn parse_arp_scan_output(stdout: &str) -> Vec<PartialHost> {
 
         let vendor = if parts.len() > 2 {
             let v = parts[2].trim();
-            if v.is_empty() { None } else { Some(v.to_string()) }
+            if v.is_empty() {
+                None
+            } else {
+                Some(v.to_string())
+            }
         } else {
             None
         };

@@ -1,17 +1,27 @@
+use super::{needs_sudo, run_with_limits, PartialHost, ScanBackend, ScanOptions, ScanResult};
 use crate::model::{BackendKind, Port, Protocol};
-use super::{needs_sudo, PartialHost, ScanBackend, ScanOptions, ScanResult};
+use crate::progress::{Reporter, ScanEvent};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::net::IpAddr;
+use std::sync::Arc;
 use tokio::process::Command;
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 
 pub struct NmapBackend;
 
 impl NmapBackend {
     pub fn new() -> Self {
         Self
+    }
+}
+
+impl Default for NmapBackend {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -25,14 +35,23 @@ impl ScanBackend for NmapBackend {
         which::which("nmap").is_ok()
     }
 
-    async fn scan(&self, target: &str, opts: &ScanOptions) -> Result<ScanResult> {
+    async fn scan(
+        &self,
+        target: &str,
+        opts: &ScanOptions,
+        cancel: &CancellationToken,
+    ) -> Result<ScanResult> {
         // Discovery scan
-        let discovery = run_nmap_discovery(target, opts).await?;
+        let discovery = run_nmap_discovery(target, opts, cancel).await?;
         Ok(discovery)
     }
 }
 
-pub async fn run_nmap_discovery(target: &str, opts: &ScanOptions) -> Result<ScanResult> {
+pub async fn run_nmap_discovery(
+    target: &str,
+    opts: &ScanOptions,
+    cancel: &CancellationToken,
+) -> Result<ScanResult> {
     let args = vec!["-sn", target, "-oX", "-"];
     let use_sudo = needs_sudo(opts);
 
@@ -47,18 +66,16 @@ pub async fn run_nmap_discovery(target: &str, opts: &ScanOptions) -> Result<Scan
     );
     let started = std::time::Instant::now();
 
-    let output = if use_sudo {
-        Command::new("sudo")
-            .arg("nmap")
-            .args(&args)
-            .output()
-            .await?
+    let mut cmd = if use_sudo {
+        let mut c = Command::new("sudo");
+        c.arg("nmap");
+        c
     } else {
         Command::new("nmap")
-            .args(&args)
-            .output()
-            .await?
     };
+    cmd.args(&args);
+
+    let output = run_with_limits(cmd, opts.stage_timeout_secs, cancel, "nmap discovery").await?;
 
     tracing::debug!(
         exit = ?output.status.code(),
@@ -85,60 +102,75 @@ pub async fn run_nmap_discovery(target: &str, opts: &ScanOptions) -> Result<Scan
     Ok(result)
 }
 
+/// Fingerprints every host, at most `opts.max_parallel` at a time.
+///
+/// Uses a semaphore rather than fixed batches: a slow host holds one permit
+/// instead of stalling every host queued behind its batch boundary.
 pub async fn run_nmap_fingerprint_all(
     hosts: &[IpAddr],
     opts: &ScanOptions,
+    reporter: &Reporter,
+    cancel: &CancellationToken,
 ) -> Result<ScanResult> {
-    let mut join_set = JoinSet::new();
-    let mut all_hosts = Vec::new();
     let total = hosts.len();
-    let batches = hosts.chunks(opts.max_parallel).count();
+    let permits = Arc::new(Semaphore::new(opts.max_parallel.max(1)));
+    let mut join_set = JoinSet::new();
+
+    for &ip in hosts {
+        let permits = permits.clone();
+        let cancel = cancel.clone();
+        let use_sudo = needs_sudo(opts);
+        let port_range = opts.port_range.clone();
+        let timeout = opts.timeout_secs;
+
+        join_set.spawn(async move {
+            // Acquiring can only fail if the semaphore is closed, which we never do.
+            let _permit = permits
+                .acquire_owned()
+                .await
+                .expect("semaphore is never closed");
+            if cancel.is_cancelled() {
+                return Ok(ScanResult {
+                    hosts: Vec::new(),
+                    edges: Vec::new(),
+                });
+            }
+            run_nmap_fingerprint_single(ip, use_sudo, &port_range, timeout, &cancel).await
+        });
+    }
+
+    let mut all_hosts = Vec::new();
     let mut completed: usize = 0;
 
-    // Process in batches to respect max_parallel
-    for (batch_idx, chunk) in hosts.chunks(opts.max_parallel).enumerate() {
-        tracing::info!(
-            batch = batch_idx + 1,
-            batches,
-            batch_size = chunk.len(),
-            completed,
-            total,
-            "nmap fingerprint: starting batch"
-        );
-        let batch_start = std::time::Instant::now();
-
-        for &ip in chunk {
-            let use_sudo = needs_sudo(opts);
-            let port_range = opts.port_range.clone();
-            let timeout = opts.timeout_secs;
-            join_set.spawn(async move {
-                run_nmap_fingerprint_single(ip, use_sudo, &port_range, timeout).await
-            });
-        }
-
-        while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok(Ok(scan_result)) => {
-                    all_hosts.extend(scan_result.hosts);
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!("nmap fingerprint failed: {}", e);
-                }
-                Err(e) => {
-                    tracing::warn!("nmap fingerprint task panicked: {}", e);
-                }
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(Ok(scan_result)) => all_hosts.extend(scan_result.hosts),
+            Ok(Err(e)) => {
+                tracing::warn!("nmap fingerprint failed: {}", e);
+                reporter.warn(format!("nmap fingerprint: {}", e));
             }
-            completed += 1;
+            Err(e) => tracing::warn!("nmap fingerprint task panicked: {}", e),
+        }
+        completed += 1;
+        reporter.send(ScanEvent::HostProgress {
+            kind: BackendKind::Nmap,
+            done: completed,
+            total,
+        });
+
+        if cancel.is_cancelled() {
+            tracing::info!(
+                completed,
+                total,
+                "nmap fingerprint: cancelled, aborting remaining hosts"
+            );
+            join_set.abort_all();
+            break;
         }
 
-        tracing::info!(
-            batch = batch_idx + 1,
-            batches,
-            completed,
-            total,
-            elapsed_ms = batch_start.elapsed().as_millis() as u64,
-            "nmap fingerprint: batch done"
-        );
+        if completed.is_multiple_of(10) || completed == total {
+            tracing::info!(completed, total, "nmap fingerprint: progress");
+        }
     }
 
     Ok(ScanResult {
@@ -151,7 +183,8 @@ async fn run_nmap_fingerprint_single(
     ip: IpAddr,
     sudo: bool,
     port_range: &str,
-    _timeout: u64,
+    timeout: u64,
+    cancel: &CancellationToken,
 ) -> Result<ScanResult> {
     let ip_str = ip.to_string();
     let mut args = vec!["-sV"];
@@ -177,18 +210,19 @@ async fn run_nmap_fingerprint_single(
     tracing::info!(host = %ip, cmd = %cmd_display, "nmap fingerprint: executing");
     let started = std::time::Instant::now();
 
-    let output = if sudo {
-        Command::new("sudo")
-            .arg("nmap")
-            .args(&args)
-            .output()
-            .await?
+    let mut cmd = if sudo {
+        let mut c = Command::new("sudo");
+        c.arg("nmap");
+        c
     } else {
         Command::new("nmap")
-            .args(&args)
-            .output()
-            .await?
     };
+    cmd.args(&args);
+
+    // nmap's own timing is per-probe, not per-host, so a filtered host can hang
+    // well past any --max-rtt-timeout. This bounds the whole invocation.
+    let output =
+        run_with_limits(cmd, timeout, cancel, &format!("nmap fingerprint of {}", ip)).await?;
 
     let elapsed_ms = started.elapsed().as_millis() as u64;
     if !output.status.success() {
@@ -294,8 +328,8 @@ struct NmapOsMatch {
 // --- Parse logic ---
 
 pub fn parse_nmap_xml(xml: &str, fingerprint_mode: bool) -> Result<ScanResult> {
-    let nmap_run: NmapRun = quick_xml::de::from_str(xml)
-        .context("Failed to parse nmap XML output")?;
+    let nmap_run: NmapRun =
+        quick_xml::de::from_str(xml).context("Failed to parse nmap XML output")?;
 
     let mut hosts = Vec::new();
 

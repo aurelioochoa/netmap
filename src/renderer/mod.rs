@@ -1,4 +1,8 @@
-use crate::model::{Host, HostGraph, HopEdge};
+mod svg;
+
+pub use svg::render_svg;
+
+use crate::model::{HopEdge, Host, HostGraph};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 
@@ -12,9 +16,7 @@ pub fn render_tree(graph: &HostGraph) -> String {
     let adj = build_adjacency(&graph.edges);
 
     // Determine root for BFS layering
-    let root_ip = graph.gateway.or_else(|| {
-        graph.hosts.keys().copied().next()
-    });
+    let root_ip = graph.gateway.or_else(|| graph.hosts.keys().copied().next());
 
     let root_ip = match root_ip {
         Some(ip) => ip,
@@ -25,7 +27,9 @@ pub fn render_tree(graph: &HostGraph) -> String {
     let (layers, connected) = bfs_layers(root_ip, &adj, &graph.hosts);
 
     // Hosts not reached by BFS (no edges)
-    let orphans: Vec<IpAddr> = graph.hosts.keys()
+    let orphans: Vec<IpAddr> = graph
+        .hosts
+        .keys()
         .filter(|ip| !connected.contains(ip))
         .copied()
         .collect();
@@ -39,7 +43,8 @@ pub fn render_tree(graph: &HostGraph) -> String {
     if !layers.is_empty() {
         let max_layer = layers.values().copied().max().unwrap_or(0);
         for layer in 0..=max_layer {
-            let mut row: Vec<IpAddr> = layers.iter()
+            let mut row: Vec<IpAddr> = layers
+                .iter()
                 .filter(|(_, &l)| l == layer)
                 .map(|(&ip, _)| ip)
                 .collect();
@@ -54,7 +59,10 @@ pub fn render_tree(graph: &HostGraph) -> String {
     if has_internet_row {
         // Find width of first row to center "Internet"
         let first_row_labels: Vec<String> = if !grid_rows.is_empty() {
-            grid_rows[0].iter().map(|ip| node_label(graph, *ip)).collect()
+            grid_rows[0]
+                .iter()
+                .map(|ip| node_label(graph, *ip))
+                .collect()
         } else {
             vec![]
         };
@@ -71,8 +79,14 @@ pub fn render_tree(graph: &HostGraph) -> String {
 
         // Vertical connector to gateway
         if !grid_rows.is_empty() {
-            let gw_row_labels: Vec<String> = grid_rows[0].iter().map(|ip| node_label(graph, *ip)).collect();
-            let gw_idx = grid_rows[0].iter().position(|&ip| ip == root_ip).unwrap_or(0);
+            let gw_row_labels: Vec<String> = grid_rows[0]
+                .iter()
+                .map(|ip| node_label(graph, *ip))
+                .collect();
+            let gw_idx = grid_rows[0]
+                .iter()
+                .position(|&ip| ip == root_ip)
+                .unwrap_or(0);
             let gw_center = node_center_offset(&gw_row_labels, gw_idx);
             output.push_str(&" ".repeat(gw_center));
             output.push('|');
@@ -167,9 +181,24 @@ pub fn render_ports_table(graph: &HostGraph) -> String {
         })
         .collect();
 
-    let w_ip = rows.iter().map(|r| r.0.len()).chain([header.0.len()]).max().unwrap_or(0);
-    let w_host = rows.iter().map(|r| r.1.len()).chain([header.1.len()]).max().unwrap_or(0);
-    let w_role = rows.iter().map(|r| r.2.len()).chain([header.2.len()]).max().unwrap_or(0);
+    let w_ip = rows
+        .iter()
+        .map(|r| r.0.len())
+        .chain([header.0.len()])
+        .max()
+        .unwrap_or(0);
+    let w_host = rows
+        .iter()
+        .map(|r| r.1.len())
+        .chain([header.1.len()])
+        .max()
+        .unwrap_or(0);
+    let w_role = rows
+        .iter()
+        .map(|r| r.2.len())
+        .chain([header.2.len()])
+        .max()
+        .unwrap_or(0);
 
     let mut out = String::new();
     out.push_str("Open Ports:\n");
@@ -206,7 +235,7 @@ pub fn render_ports_table(graph: &HostGraph) -> String {
     out
 }
 
-fn build_adjacency(edges: &[HopEdge]) -> HashMap<IpAddr, BTreeSet<IpAddr>> {
+pub(crate) fn build_adjacency(edges: &[HopEdge]) -> HashMap<IpAddr, BTreeSet<IpAddr>> {
     let mut adj: HashMap<IpAddr, BTreeSet<IpAddr>> = HashMap::new();
     for edge in edges {
         adj.entry(edge.from).or_default().insert(edge.to);
@@ -215,7 +244,7 @@ fn build_adjacency(edges: &[HopEdge]) -> HashMap<IpAddr, BTreeSet<IpAddr>> {
     adj
 }
 
-fn bfs_layers(
+pub(crate) fn bfs_layers(
     root: IpAddr,
     adj: &HashMap<IpAddr, BTreeSet<IpAddr>>,
     hosts: &HashMap<IpAddr, Host>,
@@ -246,7 +275,7 @@ fn bfs_layers(
     (layers, visited)
 }
 
-fn node_label(graph: &HostGraph, ip: IpAddr) -> String {
+pub(crate) fn node_label(graph: &HostGraph, ip: IpAddr) -> String {
     if let Some(host) = graph.hosts.get(&ip) {
         let mut label = format!("{} {}", host.role, ip);
         if let Some(ref name) = host.hostname {
@@ -311,7 +340,7 @@ fn build_vertical_connectors(
     line.iter().collect::<String>().trim_end().to_string()
 }
 
-fn sort_ips(ips: &mut Vec<IpAddr>) {
+pub(crate) fn sort_ips(ips: &mut [IpAddr]) {
     ips.sort_by_key(|ip| match ip {
         IpAddr::V4(v4) => v4.octets().to_vec(),
         IpAddr::V6(v6) => v6.octets().to_vec(),
@@ -321,7 +350,7 @@ fn sort_ips(ips: &mut Vec<IpAddr>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Host, HostGraph, HopEdge, Port, Protocol, DeviceRole, BackendKind};
+    use crate::model::{BackendKind, DeviceRole, HopEdge, Host, HostGraph, Port, Protocol};
     use std::collections::HashMap;
 
     fn make_host(ip: &str, role: DeviceRole, hostname: Option<&str>, ports: Vec<u16>) -> Host {
@@ -330,11 +359,14 @@ mod tests {
             mac: None,
             hostname: hostname.map(|s| s.to_string()),
             vendor: None,
-            open_ports: ports.into_iter().map(|p| Port {
-                number: p,
-                protocol: Protocol::Tcp,
-                service: None,
-            }).collect(),
+            open_ports: ports
+                .into_iter()
+                .map(|p| Port {
+                    number: p,
+                    protocol: Protocol::Tcp,
+                    service: None,
+                })
+                .collect(),
             os_guess: None,
             role,
             detected_by: vec![BackendKind::Nmap],
@@ -351,7 +383,12 @@ mod tests {
 
     #[test]
     fn test_render_single_host() {
-        let host = make_host("192.168.1.1", DeviceRole::Gateway, Some("router.local"), vec![]);
+        let host = make_host(
+            "192.168.1.1",
+            DeviceRole::Gateway,
+            Some("router.local"),
+            vec![],
+        );
         let mut hosts = HashMap::new();
         hosts.insert(host.ip, host);
 
@@ -379,8 +416,16 @@ mod tests {
         hosts.insert(srv.ip, srv);
 
         let edges = vec![
-            HopEdge { from: "192.168.1.1".parse().unwrap(), to: "192.168.1.2".parse().unwrap(), hop_index: 1 },
-            HopEdge { from: "192.168.1.2".parse().unwrap(), to: "192.168.1.10".parse().unwrap(), hop_index: 2 },
+            HopEdge {
+                from: "192.168.1.1".parse().unwrap(),
+                to: "192.168.1.2".parse().unwrap(),
+                hop_index: 1,
+            },
+            HopEdge {
+                from: "192.168.1.2".parse().unwrap(),
+                to: "192.168.1.10".parse().unwrap(),
+                hop_index: 2,
+            },
         ];
 
         let graph = HostGraph {
@@ -409,8 +454,16 @@ mod tests {
         hosts.insert(pc.ip, pc);
 
         let edges = vec![
-            HopEdge { from: "192.168.1.1".parse().unwrap(), to: "192.168.1.10".parse().unwrap(), hop_index: 1 },
-            HopEdge { from: "192.168.1.1".parse().unwrap(), to: "192.168.1.20".parse().unwrap(), hop_index: 1 },
+            HopEdge {
+                from: "192.168.1.1".parse().unwrap(),
+                to: "192.168.1.10".parse().unwrap(),
+                hop_index: 1,
+            },
+            HopEdge {
+                from: "192.168.1.1".parse().unwrap(),
+                to: "192.168.1.20".parse().unwrap(),
+                hop_index: 1,
+            },
         ];
 
         let graph = HostGraph {
@@ -470,12 +523,32 @@ mod tests {
         let switch = make_host("192.168.1.2", DeviceRole::Switch, None, vec![]);
         let wap1 = make_host("192.168.1.3", DeviceRole::WirelessAP, None, vec![]);
         let wap2 = make_host("192.168.1.4", DeviceRole::WirelessAP, None, vec![]);
-        let wap3 = make_host("192.168.1.5", DeviceRole::WirelessAP, Some("mesh-ap"), vec![]);
+        let wap3 = make_host(
+            "192.168.1.5",
+            DeviceRole::WirelessAP,
+            Some("mesh-ap"),
+            vec![],
+        );
         let server = make_host("192.168.1.10", DeviceRole::Server, None, vec![80, 443]);
-        let pc_tower = make_host("192.168.1.15", DeviceRole::Workstation, Some("tower"), vec![]);
+        let pc_tower = make_host(
+            "192.168.1.15",
+            DeviceRole::Workstation,
+            Some("tower"),
+            vec![],
+        );
         let server2 = make_host("192.168.1.16", DeviceRole::Server, None, vec![22, 8080]);
-        let pc_desktop = make_host("192.168.1.20", DeviceRole::Workstation, Some("desktop"), vec![]);
-        let pc_laptop = make_host("192.168.1.21", DeviceRole::Workstation, Some("laptop"), vec![]);
+        let pc_desktop = make_host(
+            "192.168.1.20",
+            DeviceRole::Workstation,
+            Some("desktop"),
+            vec![],
+        );
+        let pc_laptop = make_host(
+            "192.168.1.21",
+            DeviceRole::Workstation,
+            Some("laptop"),
+            vec![],
+        );
 
         let mut hosts = HashMap::new();
         hosts.insert(router.ip, router);
@@ -491,23 +564,59 @@ mod tests {
 
         let edges = vec![
             // router -> switch
-            HopEdge { from: "192.168.1.1".parse().unwrap(), to: "192.168.1.2".parse().unwrap(), hop_index: 1 },
+            HopEdge {
+                from: "192.168.1.1".parse().unwrap(),
+                to: "192.168.1.2".parse().unwrap(),
+                hop_index: 1,
+            },
             // switch -> wap1
-            HopEdge { from: "192.168.1.2".parse().unwrap(), to: "192.168.1.3".parse().unwrap(), hop_index: 2 },
+            HopEdge {
+                from: "192.168.1.2".parse().unwrap(),
+                to: "192.168.1.3".parse().unwrap(),
+                hop_index: 2,
+            },
             // switch -> wap3 (mesh-ap)
-            HopEdge { from: "192.168.1.2".parse().unwrap(), to: "192.168.1.5".parse().unwrap(), hop_index: 2 },
+            HopEdge {
+                from: "192.168.1.2".parse().unwrap(),
+                to: "192.168.1.5".parse().unwrap(),
+                hop_index: 2,
+            },
             // switch -> server
-            HopEdge { from: "192.168.1.2".parse().unwrap(), to: "192.168.1.10".parse().unwrap(), hop_index: 2 },
+            HopEdge {
+                from: "192.168.1.2".parse().unwrap(),
+                to: "192.168.1.10".parse().unwrap(),
+                hop_index: 2,
+            },
             // wap1 -> wap2
-            HopEdge { from: "192.168.1.3".parse().unwrap(), to: "192.168.1.4".parse().unwrap(), hop_index: 3 },
+            HopEdge {
+                from: "192.168.1.3".parse().unwrap(),
+                to: "192.168.1.4".parse().unwrap(),
+                hop_index: 3,
+            },
             // wap1 -> pc_desktop
-            HopEdge { from: "192.168.1.3".parse().unwrap(), to: "192.168.1.20".parse().unwrap(), hop_index: 3 },
+            HopEdge {
+                from: "192.168.1.3".parse().unwrap(),
+                to: "192.168.1.20".parse().unwrap(),
+                hop_index: 3,
+            },
             // wap3 -> pc_tower (left of desktop)
-            HopEdge { from: "192.168.1.5".parse().unwrap(), to: "192.168.1.15".parse().unwrap(), hop_index: 3 },
+            HopEdge {
+                from: "192.168.1.5".parse().unwrap(),
+                to: "192.168.1.15".parse().unwrap(),
+                hop_index: 3,
+            },
             // pc_tower -> server2 (down from tower)
-            HopEdge { from: "192.168.1.15".parse().unwrap(), to: "192.168.1.16".parse().unwrap(), hop_index: 4 },
+            HopEdge {
+                from: "192.168.1.15".parse().unwrap(),
+                to: "192.168.1.16".parse().unwrap(),
+                hop_index: 4,
+            },
             // wap2 -> pc_laptop
-            HopEdge { from: "192.168.1.4".parse().unwrap(), to: "192.168.1.21".parse().unwrap(), hop_index: 4 },
+            HopEdge {
+                from: "192.168.1.4".parse().unwrap(),
+                to: "192.168.1.21".parse().unwrap(),
+                hop_index: 4,
+            },
         ];
 
         let graph = HostGraph {
@@ -523,57 +632,158 @@ mod tests {
         eprintln!("--- Rendered diagram ---\n{}\n--- End ---", output);
 
         // Line 0: "Internet" header
-        assert!(lines[0].trim() == "Internet", "Expected 'Internet', got: '{}'", lines[0]);
+        assert!(
+            lines[0].trim() == "Internet",
+            "Expected 'Internet', got: '{}'",
+            lines[0]
+        );
 
         // Line 1: vertical connector "|"
-        assert!(lines[1].contains('|'), "Expected '|' connector, got: '{}'", lines[1]);
+        assert!(
+            lines[1].contains('|'),
+            "Expected '|' connector, got: '{}'",
+            lines[1]
+        );
 
         // Line 2: router (layer 0)
-        assert!(lines[2].contains("router"), "Expected 'router', got: '{}'", lines[2]);
+        assert!(
+            lines[2].contains("router"),
+            "Expected 'router', got: '{}'",
+            lines[2]
+        );
 
         // Line 3: vertical connector
-        assert!(lines[3].contains('|'), "Expected '|' connector, got: '{}'", lines[3]);
+        assert!(
+            lines[3].contains('|'),
+            "Expected '|' connector, got: '{}'",
+            lines[3]
+        );
 
         // Line 4: switch (layer 1)
-        assert!(lines[4].contains("switch"), "Expected 'switch', got: '{}'", lines[4]);
+        assert!(
+            lines[4].contains("switch"),
+            "Expected 'switch', got: '{}'",
+            lines[4]
+        );
 
         // Line 5: vertical connector
-        assert!(lines[5].contains('|'), "Expected '|' connector, got: '{}'", lines[5]);
+        assert!(
+            lines[5].contains('|'),
+            "Expected '|' connector, got: '{}'",
+            lines[5]
+        );
 
         // Line 6: layer 2 — wap1, wap3 (mesh-ap), server — three nodes
-        assert!(lines[6].contains("wap/switch"), "Expected 'wap/switch', got: '{}'", lines[6]);
-        assert!(lines[6].contains("mesh-ap"), "Expected 'mesh-ap', got: '{}'", lines[6]);
-        assert!(lines[6].contains("server"), "Expected 'server', got: '{}'", lines[6]);
+        assert!(
+            lines[6].contains("wap/switch"),
+            "Expected 'wap/switch', got: '{}'",
+            lines[6]
+        );
+        assert!(
+            lines[6].contains("mesh-ap"),
+            "Expected 'mesh-ap', got: '{}'",
+            lines[6]
+        );
+        assert!(
+            lines[6].contains("server"),
+            "Expected 'server', got: '{}'",
+            lines[6]
+        );
         // IPs now appear in every label
-        assert!(lines[6].contains("192.168.1.10"), "Expected server IP in label, got: '{}'", lines[6]);
+        assert!(
+            lines[6].contains("192.168.1.10"),
+            "Expected server IP in label, got: '{}'",
+            lines[6]
+        );
 
         // Line 7: vertical connectors (wap1 and wap3 connect down)
-        assert!(lines[7].contains('|'), "Expected '|' connector, got: '{}'", lines[7]);
+        assert!(
+            lines[7].contains('|'),
+            "Expected '|' connector, got: '{}'",
+            lines[7]
+        );
 
         // Line 8: layer 3 — wap2, tower, desktop — three nodes
-        assert!(lines[8].contains("wap/switch"), "Expected 'wap/switch', got: '{}'", lines[8]);
-        assert!(lines[8].contains("tower"), "Expected 'tower', got: '{}'", lines[8]);
-        assert!(lines[8].contains("desktop"), "Expected 'desktop', got: '{}'", lines[8]);
+        assert!(
+            lines[8].contains("wap/switch"),
+            "Expected 'wap/switch', got: '{}'",
+            lines[8]
+        );
+        assert!(
+            lines[8].contains("tower"),
+            "Expected 'tower', got: '{}'",
+            lines[8]
+        );
+        assert!(
+            lines[8].contains("desktop"),
+            "Expected 'desktop', got: '{}'",
+            lines[8]
+        );
 
         // Line 9: vertical connectors (wap2 and tower connect down)
-        assert!(lines[9].contains('|'), "Expected '|' connector, got: '{}'", lines[9]);
+        assert!(
+            lines[9].contains('|'),
+            "Expected '|' connector, got: '{}'",
+            lines[9]
+        );
 
         // Line 10: layer 4 — server2 and laptop
-        assert!(lines[10].contains("server"), "Expected 'server', got: '{}'", lines[10]);
-        assert!(lines[10].contains("192.168.1.16"), "Expected server2 IP, got: '{}'", lines[10]);
-        assert!(lines[10].contains("laptop"), "Expected 'laptop', got: '{}'", lines[10]);
+        assert!(
+            lines[10].contains("server"),
+            "Expected 'server', got: '{}'",
+            lines[10]
+        );
+        assert!(
+            lines[10].contains("192.168.1.16"),
+            "Expected server2 IP, got: '{}'",
+            lines[10]
+        );
+        assert!(
+            lines[10].contains("laptop"),
+            "Expected 'laptop', got: '{}'",
+            lines[10]
+        );
 
         // Verify total structure: 11 lines (tree only; ports table is separate)
-        assert!(lines.len() == 11, "Expected 11 lines, got {}: {:?}", lines.len(), lines);
+        assert!(
+            lines.len() == 11,
+            "Expected 11 lines, got {}: {:?}",
+            lines.len(),
+            lines
+        );
 
         // Ports now live in the companion table. Verify via render_ports_table.
         let ports_out = render_ports_table(&graph);
-        assert!(ports_out.contains("192.168.1.10"), "expected server in ports table:\n{}", ports_out);
-        assert!(ports_out.contains("80"), "expected port 80 in ports table:\n{}", ports_out);
-        assert!(ports_out.contains("443"), "expected port 443 in ports table:\n{}", ports_out);
-        assert!(ports_out.contains("192.168.1.16"), "expected server2 in ports table:\n{}", ports_out);
-        assert!(ports_out.contains("22"), "expected port 22 in ports table:\n{}", ports_out);
-        assert!(ports_out.contains("8080"), "expected port 8080 in ports table:\n{}", ports_out);
+        assert!(
+            ports_out.contains("192.168.1.10"),
+            "expected server in ports table:\n{}",
+            ports_out
+        );
+        assert!(
+            ports_out.contains("80"),
+            "expected port 80 in ports table:\n{}",
+            ports_out
+        );
+        assert!(
+            ports_out.contains("443"),
+            "expected port 443 in ports table:\n{}",
+            ports_out
+        );
+        assert!(
+            ports_out.contains("192.168.1.16"),
+            "expected server2 in ports table:\n{}",
+            ports_out
+        );
+        assert!(
+            ports_out.contains("22"),
+            "expected port 22 in ports table:\n{}",
+            ports_out
+        );
+        assert!(
+            ports_out.contains("8080"),
+            "expected port 8080 in ports table:\n{}",
+            ports_out
+        );
     }
 
     #[test]
@@ -599,7 +809,12 @@ mod tests {
 
     #[test]
     fn test_node_label_includes_ip() {
-        let host = make_host("192.168.2.1", DeviceRole::Gateway, Some("OpenWrt.lan"), vec![22, 80]);
+        let host = make_host(
+            "192.168.2.1",
+            DeviceRole::Gateway,
+            Some("OpenWrt.lan"),
+            vec![22, 80],
+        );
         let mut hosts = HashMap::new();
         hosts.insert(host.ip, host);
         let graph = HostGraph {
@@ -610,20 +825,42 @@ mod tests {
         let label = node_label(&graph, "192.168.2.1".parse().unwrap());
         assert!(label.contains("router"), "expected role: {}", label);
         assert!(label.contains("192.168.2.1"), "expected IP: {}", label);
-        assert!(label.contains("OpenWrt.lan"), "expected hostname: {}", label);
+        assert!(
+            label.contains("OpenWrt.lan"),
+            "expected hostname: {}",
+            label
+        );
         // Ports must NOT be in the label anymore (they live in the ports table).
-        assert!(!label.contains(":22"), "ports should not appear inline: {}", label);
-        assert!(!label.contains(":80"), "ports should not appear inline: {}", label);
+        assert!(
+            !label.contains(":22"),
+            "ports should not appear inline: {}",
+            label
+        );
+        assert!(
+            !label.contains(":80"),
+            "ports should not appear inline: {}",
+            label
+        );
     }
 
     #[test]
     fn test_ports_table_basic() {
-        let mut h1 = make_host("192.168.2.1", DeviceRole::Gateway, Some("OpenWrt.lan"), vec![22, 53, 80]);
+        let mut h1 = make_host(
+            "192.168.2.1",
+            DeviceRole::Gateway,
+            Some("OpenWrt.lan"),
+            vec![22, 53, 80],
+        );
         // Add service names on some ports
         h1.open_ports[0].service = Some("ssh".to_string());
         h1.open_ports[1].service = Some("domain".to_string());
         h1.open_ports[2].service = Some("http".to_string());
-        let h2 = make_host("192.168.2.125", DeviceRole::Server, Some("mainframe"), vec![22]);
+        let h2 = make_host(
+            "192.168.2.125",
+            DeviceRole::Server,
+            Some("mainframe"),
+            vec![22],
+        );
         let h3_noports = make_host("192.168.2.200", DeviceRole::Unknown, None, vec![]);
 
         let mut hosts = HashMap::new();
@@ -655,7 +892,11 @@ mod tests {
         assert!(out.contains("mainframe"));
 
         // Host without ports does not appear
-        assert!(!out.contains("192.168.2.200"), "host with no ports should not appear: {}", out);
+        assert!(
+            !out.contains("192.168.2.200"),
+            "host with no ports should not appear: {}",
+            out
+        );
 
         // Host without a named service falls back to the bare port number
         let h_noname = {
@@ -671,9 +912,17 @@ mod tests {
             gateway: None,
         };
         let out2 = render_ports_table(&graph2);
-        assert!(out2.contains("192.168.2.250"), "unnamed-svc host should appear: {}", out2);
+        assert!(
+            out2.contains("192.168.2.250"),
+            "unnamed-svc host should appear: {}",
+            out2
+        );
         // The "8080" should NOT be followed by '/' (no service suffix)
-        assert!(out2.contains(" 8080\n") || out2.ends_with(" 8080\n"), "expected bare port 8080: {}", out2);
+        assert!(
+            out2.contains(" 8080\n") || out2.ends_with(" 8080\n"),
+            "expected bare port 8080: {}",
+            out2
+        );
     }
 
     #[test]
@@ -687,6 +936,10 @@ mod tests {
             gateway: None,
         };
         let out = render_ports_table(&graph);
-        assert_eq!(out, "", "empty port set should produce empty output, got: {:?}", out);
+        assert_eq!(
+            out, "",
+            "empty port set should produce empty output, got: {:?}",
+            out
+        );
     }
 }

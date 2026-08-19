@@ -2,44 +2,136 @@ use crate::backends::arp_scan::ArpScanBackend;
 use crate::backends::ip_neigh::IpNeighBackend;
 use crate::backends::nmap::{self, NmapBackend};
 use crate::backends::traceroute::{self, TracerouteBackend};
-use crate::backends::{ScanBackend, ScanOptions, ScanResult, PartialHost};
+use crate::backends::{PartialHost, ScanBackend, ScanOptions, ScanResult};
 use crate::model::{BackendKind, DeviceRole, HopEdge, Host, HostGraph};
+use crate::progress::{Reporter, ScanEvent};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 /// Run the full scan pipeline and return a merged HostGraph.
+///
+/// Convenience wrapper: no progress reporting, no cancellation. Use
+/// [`run_pipeline_with_progress`] when you need either.
 pub async fn run_pipeline(target: &str, opts: &ScanOptions) -> Result<HostGraph> {
+    run_pipeline_with_progress(target, opts, Reporter::silent(), CancellationToken::new()).await
+}
+
+/// Run the pipeline, stopping early if `cancel` fires.
+///
+/// Whatever was discovered before cancellation is still returned, so callers can
+/// show partial results rather than throwing the work away.
+pub async fn run_pipeline_cancellable(
+    target: &str,
+    opts: &ScanOptions,
+    cancel: CancellationToken,
+) -> Result<HostGraph> {
+    run_pipeline_with_progress(target, opts, Reporter::silent(), cancel).await
+}
+
+/// Run the pipeline, emitting [`ScanEvent`]s as it goes.
+///
+/// Events are emitted at the same points the pipeline already logs, so the
+/// stream a GUI sees and the `tracing` output a CLI user sees stay in step.
+/// Returns the graph built so far even when cancelled.
+pub async fn run_pipeline_with_progress(
+    target: &str,
+    opts: &ScanOptions,
+    reporter: Reporter,
+    cancel: CancellationToken,
+) -> Result<HostGraph> {
     let pipeline_start = Instant::now();
     let mut graph = HostGraph::empty();
+    let total_stages = 5;
+
+    // Checked between stages; the per-host runners also select on it internally
+    // so a long nmap sweep aborts promptly rather than at the next stage boundary.
+    macro_rules! bail_if_cancelled {
+        () => {
+            if cancel.is_cancelled() {
+                tracing::warn!("scan cancelled, returning partial results");
+                finalize(&mut graph, target, opts, &reporter);
+                reporter.send(ScanEvent::Cancelled);
+                return Ok(graph);
+            }
+        };
+    }
 
     // Stage 1: ip neigh
     if opts.skip_backends.contains(&BackendKind::IpNeigh) {
-        tracing::info!("stage ip-neigh: skipped (--skip)");
+        skip_stage(&reporter, BackendKind::IpNeigh, "ip-neigh", "--skip");
     } else {
-        run_stage(&IpNeighBackend::new(), target, opts, &mut graph).await;
+        run_stage(
+            &IpNeighBackend::new(),
+            target,
+            opts,
+            &mut graph,
+            StageCtx {
+                reporter: &reporter,
+                cancel: &cancel,
+                stage_index: 0,
+                total_stages,
+            },
+        )
+        .await;
     }
+
+    bail_if_cancelled!();
 
     // Stage 2: arp-scan
     if opts.skip_backends.contains(&BackendKind::ArpScan) {
-        tracing::info!("stage arp-scan: skipped (--skip)");
+        skip_stage(&reporter, BackendKind::ArpScan, "arp-scan", "--skip");
     } else {
-        run_stage(&ArpScanBackend::new(), target, opts, &mut graph).await;
+        run_stage(
+            &ArpScanBackend::new(),
+            target,
+            opts,
+            &mut graph,
+            StageCtx {
+                reporter: &reporter,
+                cancel: &cancel,
+                stage_index: 1,
+                total_stages,
+            },
+        )
+        .await;
     }
+
+    bail_if_cancelled!();
 
     // Stage 3: nmap discovery
     if opts.skip_backends.contains(&BackendKind::Nmap) {
-        tracing::info!("stage nmap-discovery: skipped (--skip)");
+        skip_stage(&reporter, BackendKind::Nmap, "nmap-discovery", "--skip");
     } else {
-        run_stage(&NmapBackend::new(), target, opts, &mut graph).await;
+        run_stage(
+            &NmapBackend::new(),
+            target,
+            opts,
+            &mut graph,
+            StageCtx {
+                reporter: &reporter,
+                cancel: &cancel,
+                stage_index: 2,
+                total_stages,
+            },
+        )
+        .await;
     }
+
+    bail_if_cancelled!();
 
     // Stage 4: nmap fingerprint (per host)
     if opts.skip_backends.contains(&BackendKind::Nmap) {
-        tracing::info!("stage nmap-fingerprint: skipped (--skip)");
+        skip_stage(&reporter, BackendKind::Nmap, "nmap-fingerprint", "--skip");
     } else if !NmapBackend::new().is_available() {
-        tracing::warn!("stage nmap-fingerprint: nmap binary not found, skipping");
+        skip_stage(
+            &reporter,
+            BackendKind::Nmap,
+            "nmap-fingerprint",
+            "nmap binary not found",
+        );
     } else {
         let ips: Vec<IpAddr> = graph.hosts.keys().copied().collect();
         if ips.is_empty() {
@@ -51,26 +143,41 @@ pub async fn run_pipeline(target: &str, opts: &ScanOptions) -> Result<HostGraph>
                 max_parallel = opts.max_parallel,
                 "stage nmap-fingerprint: starting"
             );
-            match nmap::run_nmap_fingerprint_all(&ips, opts).await {
+            reporter.send(ScanEvent::StageStarted {
+                kind: BackendKind::Nmap,
+                stage_index: 3,
+                total_stages,
+            });
+            match nmap::run_nmap_fingerprint_all(&ips, opts, &reporter, &cancel).await {
                 Ok(result) => {
                     let host_count = result.hosts.len();
-                    merge_result(&mut graph, result, true);
+                    merge_result_reporting(&mut graph, result, true, &reporter);
                     tracing::info!(
                         fingerprinted = host_count,
                         elapsed_ms = stage_start.elapsed().as_millis() as u64,
                         "stage nmap-fingerprint: done"
                     );
                 }
-                Err(e) => tracing::warn!("stage nmap-fingerprint failed: {}", e),
+                Err(e) => {
+                    tracing::warn!("stage nmap-fingerprint failed: {}", e);
+                    reporter.warn(format!("nmap fingerprint stage failed: {}", e));
+                }
             }
         }
     }
 
+    bail_if_cancelled!();
+
     // Stage 5: traceroute (per host)
     if opts.skip_backends.contains(&BackendKind::Traceroute) {
-        tracing::info!("stage traceroute: skipped (--skip)");
+        skip_stage(&reporter, BackendKind::Traceroute, "traceroute", "--skip");
     } else if !TracerouteBackend::new().is_available() {
-        tracing::warn!("stage traceroute: traceroute binary not found, skipping");
+        skip_stage(
+            &reporter,
+            BackendKind::Traceroute,
+            "traceroute",
+            "traceroute binary not found",
+        );
     } else {
         let ips: Vec<IpAddr> = graph.hosts.keys().copied().collect();
         if ips.is_empty() {
@@ -82,12 +189,20 @@ pub async fn run_pipeline(target: &str, opts: &ScanOptions) -> Result<HostGraph>
                 max_parallel = opts.max_parallel,
                 "stage traceroute: starting"
             );
-            match traceroute::run_traceroute_all(&ips, opts).await {
+            reporter.send(ScanEvent::StageStarted {
+                kind: BackendKind::Traceroute,
+                stage_index: 4,
+                total_stages,
+            });
+            match traceroute::run_traceroute_all(&ips, opts, &reporter, &cancel).await {
                 Ok(result) => {
                     let edge_count = result.edges.len();
                     let host_count = result.hosts.len();
                     graph.edges.extend(result.edges.clone());
-                    merge_result(&mut graph, result, false);
+                    for edge in &result.edges {
+                        reporter.send(ScanEvent::EdgeDiscovered(edge.clone()));
+                    }
+                    merge_result_reporting(&mut graph, result, false, &reporter);
                     tracing::info!(
                         edges = edge_count,
                         hosts = host_count,
@@ -95,17 +210,40 @@ pub async fn run_pipeline(target: &str, opts: &ScanOptions) -> Result<HostGraph>
                         "stage traceroute: done"
                     );
                 }
-                Err(e) => tracing::warn!("stage traceroute failed: {}", e),
+                Err(e) => {
+                    tracing::warn!("stage traceroute failed: {}", e);
+                    reporter.warn(format!("traceroute stage failed: {}", e));
+                }
             }
         }
     }
 
+    finalize(&mut graph, target, opts, &reporter);
+
+    tracing::info!(
+        hosts = graph.hosts.len(),
+        edges = graph.edges.len(),
+        gateway = ?graph.gateway,
+        total_ms = pipeline_start.elapsed().as_millis() as u64,
+        "pipeline complete"
+    );
+
+    reporter.send(ScanEvent::Complete(Box::new(graph.clone())));
+
+    Ok(graph)
+}
+
+/// Post-processing shared by a completed scan and a cancelled one.
+///
+/// Cancellation still runs this so partial results arrive as a coherent graph —
+/// filtered, gateway-resolved, and role-annotated — rather than a raw host dump.
+fn finalize(graph: &mut HostGraph, target: &str, opts: &ScanOptions, reporter: &Reporter) {
     // Filter off-target hosts (docker bridge / IPv6 link-local / ULA leaked via
     // `ip neigh`) so they don't pollute the graph. Skipped when the target is
     // not a CIDR (bare IP or hostname) or when --show-off-target is set.
     if !opts.show_off_target {
         if let Some((network, prefix)) = parse_cidr(target) {
-            apply_cidr_filter(&mut graph, network, prefix);
+            apply_cidr_filter(graph, network, prefix);
         }
     }
 
@@ -126,6 +264,10 @@ pub async fn run_pipeline(target: &str, opts: &ScanOptions) -> Result<HostGraph>
         }
     }
 
+    if let Some(gw) = graph.gateway {
+        reporter.send(ScanEvent::GatewayIdentified(gw));
+    }
+
     // If no edges from traceroute but we now know a gateway, synthesize a star
     // topology so the renderer can produce a proper tree. Flagged in the log
     // so the user knows the layout isn't from real L2/L3 data.
@@ -133,7 +275,11 @@ pub async fn run_pipeline(target: &str, opts: &ScanOptions) -> Result<HostGraph>
         if let Some(gw) = graph.gateway {
             let others: Vec<IpAddr> = graph.hosts.keys().copied().filter(|ip| *ip != gw).collect();
             for ip in &others {
-                graph.edges.push(HopEdge { from: gw, to: *ip, hop_index: 1 });
+                graph.edges.push(HopEdge {
+                    from: gw,
+                    to: *ip,
+                    hop_index: 1,
+                });
             }
             if !others.is_empty() {
                 tracing::info!(
@@ -156,17 +302,54 @@ pub async fn run_pipeline(target: &str, opts: &ScanOptions) -> Result<HostGraph>
 
     // Infer roles (runs after gateway fallback + star synthesis so the gateway
     // host correctly gets DeviceRole::Gateway and peer_count is meaningful).
-    infer_roles(&mut graph);
+    infer_roles(graph);
+}
 
-    tracing::info!(
-        hosts = graph.hosts.len(),
-        edges = graph.edges.len(),
-        gateway = ?graph.gateway,
-        total_ms = pipeline_start.elapsed().as_millis() as u64,
-        "pipeline complete"
-    );
+/// Logs and reports a stage that will not run.
+fn skip_stage(reporter: &Reporter, kind: BackendKind, label: &str, reason: &str) {
+    tracing::info!("stage {}: skipped ({})", label, reason);
+    reporter.send(ScanEvent::StageSkipped {
+        kind,
+        reason: format!("{}: {}", label, reason),
+    });
+}
 
-    Ok(graph)
+/// [`merge_result`] plus a `HostDiscovered`/`HostUpdated` event per host.
+///
+/// Building the event clones a `Host`, so it is skipped entirely when nothing
+/// is listening — which is the CLI's case and every existing test's case.
+fn merge_result_reporting(
+    graph: &mut HostGraph,
+    result: ScanResult,
+    is_fingerprint: bool,
+    reporter: &Reporter,
+) {
+    if !reporter.is_active() {
+        merge_result(graph, result, is_fingerprint);
+        return;
+    }
+    for partial in result.hosts {
+        let ip = partial.ip;
+        let was_known = graph.hosts.contains_key(&ip);
+        merge_partial_host(graph, partial, is_fingerprint);
+        if let Some(host) = graph.hosts.get(&ip) {
+            let boxed = Box::new(host.clone());
+            reporter.send(if was_known {
+                ScanEvent::HostUpdated(boxed)
+            } else {
+                ScanEvent::HostDiscovered(boxed)
+            });
+        }
+    }
+}
+
+/// The plumbing every stage needs, kept together so `run_stage` does not grow
+/// an ever-longer tail of positional arguments.
+struct StageCtx<'a> {
+    reporter: &'a Reporter,
+    cancel: &'a CancellationToken,
+    stage_index: usize,
+    total_stages: usize,
 }
 
 async fn run_stage(
@@ -174,21 +357,41 @@ async fn run_stage(
     target: &str,
     opts: &ScanOptions,
     graph: &mut HostGraph,
+    ctx: StageCtx<'_>,
 ) {
+    let StageCtx {
+        reporter,
+        cancel,
+        stage_index,
+        total_stages,
+    } = ctx;
     let name = backend.name();
     if !backend.is_available() {
-        tracing::warn!("stage {}: binary not found, skipping", name);
+        skip_stage(reporter, name, &name.to_string(), "binary not found");
         return;
     }
 
     let stage_start = Instant::now();
     tracing::info!("stage {}: starting", name);
+    reporter.send(ScanEvent::StageStarted {
+        kind: name,
+        stage_index,
+        total_stages,
+    });
 
-    match backend.scan(target, opts).await {
+    match backend.scan(target, opts, cancel).await {
         Ok(result) => {
             let host_count = result.hosts.len();
             let edge_count = result.edges.len();
-            merge_result(graph, result, false);
+            for edge in &result.edges {
+                reporter.send(ScanEvent::EdgeDiscovered(edge.clone()));
+            }
+            merge_result_reporting(graph, result, false, reporter);
+            reporter.send(ScanEvent::StageFinished {
+                kind: name,
+                elapsed_ms: stage_start.elapsed().as_millis() as u64,
+                found: host_count,
+            });
             tracing::info!(
                 backend = %name,
                 hosts = host_count,
@@ -199,13 +402,16 @@ async fn run_stage(
                 name
             );
         }
-        Err(e) => tracing::warn!(
-            backend = %name,
-            elapsed_ms = stage_start.elapsed().as_millis() as u64,
-            "stage {} failed: {}",
-            name,
-            e
-        ),
+        Err(e) => {
+            tracing::warn!(
+                backend = %name,
+                elapsed_ms = stage_start.elapsed().as_millis() as u64,
+                "stage {} failed: {}",
+                name,
+                e
+            );
+            reporter.warn(format!("{} stage failed: {}", name, e));
+        }
     }
 }
 
@@ -216,7 +422,10 @@ pub fn merge_result(graph: &mut HostGraph, result: ScanResult, is_fingerprint: b
 }
 
 pub fn merge_partial_host(graph: &mut HostGraph, partial: PartialHost, is_fingerprint: bool) {
-    let host = graph.hosts.entry(partial.ip).or_insert_with(|| Host::new(partial.ip));
+    let host = graph
+        .hosts
+        .entry(partial.ip)
+        .or_insert_with(|| Host::new(partial.ip));
 
     // MAC: prefer arp-scan over nmap
     if partial.mac.is_some() {
@@ -276,8 +485,14 @@ pub fn infer_roles(graph: &mut HostGraph) {
     // Count how many distinct peers each IP connects to in edges
     let mut connection_count: HashMap<IpAddr, HashSet<IpAddr>> = HashMap::new();
     for edge in &graph.edges {
-        connection_count.entry(edge.from).or_default().insert(edge.to);
-        connection_count.entry(edge.to).or_default().insert(edge.from);
+        connection_count
+            .entry(edge.from)
+            .or_default()
+            .insert(edge.to);
+        connection_count
+            .entry(edge.to)
+            .or_default()
+            .insert(edge.from);
     }
 
     for host in graph.hosts.values_mut() {
@@ -303,7 +518,10 @@ pub fn infer_single_role(host: &Host, gateway_ip: Option<IpAddr>, peer_count: us
     let workstation_ports: HashSet<u16> = [139, 445, 3389].iter().copied().collect();
 
     // Switch/WAP: intermediate hop connecting multiple peers, no standard ports
-    if peer_count >= 2 && port_numbers.is_disjoint(&server_ports) && port_numbers.is_disjoint(&workstation_ports) {
+    if peer_count >= 2
+        && port_numbers.is_disjoint(&server_ports)
+        && port_numbers.is_disjoint(&workstation_ports)
+    {
         if let Some(vendor) = &host.vendor {
             let v = vendor.to_lowercase();
             if is_wap_vendor(&v) {
@@ -331,7 +549,10 @@ pub fn infer_single_role(host: &Host, gateway_ip: Option<IpAddr>, peer_count: us
 
     // IoT: detected by arp-scan, no standard server/workstation ports
     let detected_by_arp = host.detected_by.contains(&BackendKind::ArpScan);
-    if detected_by_arp && port_numbers.is_disjoint(&server_ports) && port_numbers.is_disjoint(&workstation_ports) {
+    if detected_by_arp
+        && port_numbers.is_disjoint(&server_ports)
+        && port_numbers.is_disjoint(&workstation_ports)
+    {
         if let Some(vendor) = &host.vendor {
             let v = vendor.to_lowercase();
             if is_iot_vendor(&v) {
@@ -348,25 +569,41 @@ pub fn infer_single_role(host: &Host, gateway_ip: Option<IpAddr>, peer_count: us
 
 fn is_iot_vendor(vendor_lower: &str) -> bool {
     const IOT_KEYWORDS: &[&str] = &[
-        "philips", "hue", "sonos", "nest", "ring", "wyze", "tuya",
-        "shelly", "tasmota", "espressif", "raspberry",
+        "philips",
+        "hue",
+        "sonos",
+        "nest",
+        "ring",
+        "wyze",
+        "tuya",
+        "shelly",
+        "tasmota",
+        "espressif",
+        "raspberry",
     ];
     IOT_KEYWORDS.iter().any(|kw| vendor_lower.contains(kw))
 }
 
 fn is_switch_vendor(vendor_lower: &str) -> bool {
     const SWITCH_KEYWORDS: &[&str] = &[
-        "cisco", "netgear", "tp-link", "tplink", "d-link", "dlink",
-        "juniper", "aruba", "hpe", "hewlett", "dell", "mikrotik",
-        "zyxel", "linksys",
+        "cisco", "netgear", "tp-link", "tplink", "d-link", "dlink", "juniper", "aruba", "hpe",
+        "hewlett", "dell", "mikrotik", "zyxel", "linksys",
     ];
     SWITCH_KEYWORDS.iter().any(|kw| vendor_lower.contains(kw))
 }
 
 fn is_wap_vendor(vendor_lower: &str) -> bool {
     const WAP_KEYWORDS: &[&str] = &[
-        "ubiquiti", "unifi", "ruckus", "meraki", "engenius",
-        "cambium", "aruba", "eero", "google wifi", "mesh",
+        "ubiquiti",
+        "unifi",
+        "ruckus",
+        "meraki",
+        "engenius",
+        "cambium",
+        "aruba",
+        "eero",
+        "google wifi",
+        "mesh",
     ];
     WAP_KEYWORDS.iter().any(|kw| vendor_lower.contains(kw))
 }
@@ -534,7 +771,11 @@ mod tests {
             mac: Some("11:22:33:44:55:66".to_string()),
             hostname: Some("host-from-nmap".to_string()),
             vendor: Some("TestVendor".to_string()),
-            open_ports: vec![Port { number: 80, protocol: Protocol::Tcp, service: Some("http".to_string()) }],
+            open_ports: vec![Port {
+                number: 80,
+                protocol: Protocol::Tcp,
+                service: Some("http".to_string()),
+            }],
             os_guess: Some("Linux".to_string()),
             detected_by: BackendKind::Nmap,
             hop_distance: None,
@@ -543,7 +784,10 @@ mod tests {
         merge_partial_host(&mut graph, p1, false);
         merge_partial_host(&mut graph, p2, true);
 
-        let host = graph.hosts.get(&"192.168.1.10".parse::<IpAddr>().unwrap()).unwrap();
+        let host = graph
+            .hosts
+            .get(&"192.168.1.10".parse::<IpAddr>().unwrap())
+            .unwrap();
 
         // Hostname: nmap preferred
         assert_eq!(host.hostname, Some("host-from-nmap".to_string()));
@@ -588,7 +832,10 @@ mod tests {
         merge_partial_host(&mut graph, p_nmap, false);
         merge_partial_host(&mut graph, p_arp, false);
 
-        let host = graph.hosts.get(&"192.168.1.5".parse::<IpAddr>().unwrap()).unwrap();
+        let host = graph
+            .hosts
+            .get(&"192.168.1.5".parse::<IpAddr>().unwrap())
+            .unwrap();
         // arp-scan MAC should win
         assert_eq!(host.mac, Some("arp:mac:11:11:11:11".to_string()));
     }
@@ -618,8 +865,16 @@ mod tests {
             hostname: None,
             vendor: None,
             open_ports: vec![
-                Port { number: 80, protocol: Protocol::Tcp, service: Some("http".to_string()) },
-                Port { number: 443, protocol: Protocol::Tcp, service: Some("https".to_string()) },
+                Port {
+                    number: 80,
+                    protocol: Protocol::Tcp,
+                    service: Some("http".to_string()),
+                },
+                Port {
+                    number: 443,
+                    protocol: Protocol::Tcp,
+                    service: Some("https".to_string()),
+                },
             ],
             os_guess: None,
             role: DeviceRole::Unknown,
@@ -637,9 +892,11 @@ mod tests {
             mac: None,
             hostname: None,
             vendor: None,
-            open_ports: vec![
-                Port { number: 445, protocol: Protocol::Tcp, service: Some("microsoft-ds".to_string()) },
-            ],
+            open_ports: vec![Port {
+                number: 445,
+                protocol: Protocol::Tcp,
+                service: Some("microsoft-ds".to_string()),
+            }],
             os_guess: None,
             role: DeviceRole::Unknown,
             detected_by: vec![BackendKind::Nmap],
@@ -739,8 +996,16 @@ mod tests {
     fn test_gateway_detection_from_edges() {
         use crate::model::HopEdge;
         let edges = vec![
-            HopEdge { from: "192.168.1.100".parse().unwrap(), to: "192.168.1.1".parse().unwrap(), hop_index: 1 },
-            HopEdge { from: "192.168.1.200".parse().unwrap(), to: "192.168.1.1".parse().unwrap(), hop_index: 1 },
+            HopEdge {
+                from: "192.168.1.100".parse().unwrap(),
+                to: "192.168.1.1".parse().unwrap(),
+                hop_index: 1,
+            },
+            HopEdge {
+                from: "192.168.1.200".parse().unwrap(),
+                to: "192.168.1.1".parse().unwrap(),
+                hop_index: 1,
+            },
         ];
         let gw = crate::backends::traceroute::detect_gateway(&edges);
         assert_eq!(gw, Some("192.168.1.1".parse().unwrap()));
@@ -748,8 +1013,14 @@ mod tests {
 
     #[test]
     fn test_lookup_oui_vendor() {
-        assert_eq!(lookup_oui_vendor("B8:27:EB:11:22:33"), Some("Raspberry Pi Foundation".to_string()));
-        assert_eq!(lookup_oui_vendor("00:17:88:aa:bb:cc"), Some("Philips Lighting BV".to_string()));
+        assert_eq!(
+            lookup_oui_vendor("B8:27:EB:11:22:33"),
+            Some("Raspberry Pi Foundation".to_string())
+        );
+        assert_eq!(
+            lookup_oui_vendor("00:17:88:aa:bb:cc"),
+            Some("Philips Lighting BV".to_string())
+        );
         assert!(lookup_oui_vendor("ff:ff:ff:ff:ff:ff").is_none());
     }
 
@@ -789,25 +1060,43 @@ mod tests {
     fn test_ip_in_cidr_cross_family_is_false() {
         let v4_net: IpAddr = "192.168.2.0".parse().unwrap();
         let v6: IpAddr = "fe80::1".parse().unwrap();
-        assert!(!ip_in_cidr(v6, v4_net, 24), "v6 address must not match v4 CIDR");
+        assert!(
+            !ip_in_cidr(v6, v4_net, 24),
+            "v6 address must not match v4 CIDR"
+        );
     }
 
     #[test]
     fn test_canonical_network_v4() {
         let net: IpAddr = "192.168.2.42".parse().unwrap();
-        assert_eq!(canonical_network(net, 24), "192.168.2.0".parse::<IpAddr>().unwrap());
-        assert_eq!(canonical_network(net, 16), "192.168.0.0".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            canonical_network(net, 24),
+            "192.168.2.0".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            canonical_network(net, 16),
+            "192.168.0.0".parse::<IpAddr>().unwrap()
+        );
         assert_eq!(canonical_network(net, 32), net);
-        assert_eq!(canonical_network(net, 0), "0.0.0.0".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            canonical_network(net, 0),
+            "0.0.0.0".parse::<IpAddr>().unwrap()
+        );
     }
 
     #[test]
     fn test_gateway_dot_one() {
         let net: IpAddr = "192.168.2.0".parse().unwrap();
-        assert_eq!(gateway_dot_one(net, 24), Some("192.168.2.1".parse().unwrap()));
+        assert_eq!(
+            gateway_dot_one(net, 24),
+            Some("192.168.2.1".parse().unwrap())
+        );
         // Canonicalization: even if we pass a non-network address, we should still get .1
         let offset: IpAddr = "192.168.2.42".parse().unwrap();
-        assert_eq!(gateway_dot_one(offset, 24), Some("192.168.2.1".parse().unwrap()));
+        assert_eq!(
+            gateway_dot_one(offset, 24),
+            Some("192.168.2.1".parse().unwrap())
+        );
         // /32 has no host portion
         assert_eq!(gateway_dot_one(net, 32), None);
         // IPv6 not supported yet
@@ -840,12 +1129,7 @@ mod tests {
 
     #[test]
     fn test_cidr_filter_drops_off_target_hosts() {
-        let mut g = graph_with_hosts(&[
-            "192.168.2.1",
-            "192.168.2.125",
-            "172.18.0.2",
-            "172.19.0.2",
-        ]);
+        let mut g = graph_with_hosts(&["192.168.2.1", "192.168.2.125", "172.18.0.2", "172.19.0.2"]);
         // Include an edge that crosses the target boundary; it must go too.
         g.edges.push(HopEdge {
             from: "192.168.2.1".parse().unwrap(),
@@ -863,9 +1147,15 @@ mod tests {
         apply_cidr_filter(&mut g, net, prefix);
 
         assert_eq!(g.hosts.len(), 2);
-        assert!(g.hosts.contains_key(&"192.168.2.1".parse::<IpAddr>().unwrap()));
-        assert!(g.hosts.contains_key(&"192.168.2.125".parse::<IpAddr>().unwrap()));
-        assert!(!g.hosts.contains_key(&"172.18.0.2".parse::<IpAddr>().unwrap()));
+        assert!(g
+            .hosts
+            .contains_key(&"192.168.2.1".parse::<IpAddr>().unwrap()));
+        assert!(g
+            .hosts
+            .contains_key(&"192.168.2.125".parse::<IpAddr>().unwrap()));
+        assert!(!g
+            .hosts
+            .contains_key(&"172.18.0.2".parse::<IpAddr>().unwrap()));
         // Only the in-CIDR edge remains
         assert_eq!(g.edges.len(), 1);
         assert_eq!(g.edges[0].to, "192.168.2.125".parse::<IpAddr>().unwrap());
@@ -880,30 +1170,58 @@ mod tests {
         assert_eq!(g.hosts.len(), before_hosts);
     }
 
+    // The three tests below drive the pipeline's own post-processing via
+    // `finalize` rather than re-implementing it. An earlier version inlined the
+    // star-synthesis and gateway-fallback logic, which meant they would keep
+    // passing even if the pipeline itself regressed.
+
     #[test]
     fn test_gateway_fallback_finds_dot_one() {
-        // Simulate the post-merge state: we have hosts, zero edges, and
-        // detect_gateway therefore returns None. Manually reproduce the
-        // fallback logic.
-        let g = graph_with_hosts(&["192.168.2.1", "192.168.2.125", "192.168.2.200"]);
-        let (net, prefix) = parse_cidr("192.168.2.0/24").unwrap();
-        let candidate = gateway_dot_one(net, prefix).unwrap();
-        assert!(g.hosts.contains_key(&candidate));
-        assert_eq!(candidate, "192.168.2.1".parse::<IpAddr>().unwrap());
+        let mut g = graph_with_hosts(&["192.168.2.1", "192.168.2.125", "192.168.2.200"]);
+        assert!(
+            g.edges.is_empty(),
+            "no traceroute edges, so detect_gateway will find nothing"
+        );
+
+        finalize(
+            &mut g,
+            "192.168.2.0/24",
+            &ScanOptions::default(),
+            &Reporter::silent(),
+        );
+
+        assert_eq!(
+            g.gateway,
+            Some("192.168.2.1".parse::<IpAddr>().unwrap()),
+            "the .1 host should be adopted as the gateway"
+        );
+        assert_eq!(
+            g.hosts[&"192.168.2.1".parse::<IpAddr>().unwrap()].role,
+            DeviceRole::Gateway,
+            "role inference should follow the gateway fallback"
+        );
     }
 
     #[test]
     fn test_gateway_fallback_absent_when_dot_one_missing() {
-        // No .1 in the scanned hosts — fallback should yield nothing usable.
-        let g = graph_with_hosts(&["192.168.2.5", "192.168.2.6"]);
-        let (net, prefix) = parse_cidr("192.168.2.0/24").unwrap();
-        let candidate = gateway_dot_one(net, prefix).unwrap();
-        assert!(!g.hosts.contains_key(&candidate));
+        let mut g = graph_with_hosts(&["192.168.2.5", "192.168.2.6"]);
+
+        finalize(
+            &mut g,
+            "192.168.2.0/24",
+            &ScanOptions::default(),
+            &Reporter::silent(),
+        );
+
+        assert_eq!(g.gateway, None, "no .1 host means no gateway to infer");
+        assert!(
+            g.edges.is_empty(),
+            "star synthesis needs a gateway to centre on"
+        );
     }
 
     #[test]
     fn test_star_topology_synthesis_shape() {
-        // Reproduce the pipeline's star synthesis against a fixed graph.
         let mut g = graph_with_hosts(&[
             "192.168.2.1",
             "192.168.2.100",
@@ -912,34 +1230,96 @@ mod tests {
         ]);
         assert!(g.edges.is_empty());
 
+        finalize(
+            &mut g,
+            "192.168.2.0/24",
+            &ScanOptions::default(),
+            &Reporter::silent(),
+        );
+
         let gw: IpAddr = "192.168.2.1".parse().unwrap();
-        g.gateway = Some(gw);
-
-        // Inline the pipeline's star synthesis logic.
-        if g.edges.is_empty() {
-            if let Some(gateway) = g.gateway {
-                let others: Vec<IpAddr> = g
-                    .hosts
-                    .keys()
-                    .copied()
-                    .filter(|ip| *ip != gateway)
-                    .collect();
-                for ip in &others {
-                    g.edges.push(HopEdge {
-                        from: gateway,
-                        to: *ip,
-                        hop_index: 1,
-                    });
-                }
-            }
-        }
-
-        assert_eq!(g.edges.len(), 3, "3 non-gateway hosts → 3 synthetic edges");
+        assert_eq!(g.gateway, Some(gw));
+        assert_eq!(g.edges.len(), 3, "3 non-gateway hosts -> 3 synthetic edges");
         for edge in &g.edges {
             assert_eq!(edge.from, gw);
             assert_eq!(edge.hop_index, 1);
             assert!(g.hosts.contains_key(&edge.to));
             assert_ne!(edge.to, gw);
         }
+    }
+
+    #[test]
+    fn finalize_does_not_invent_edges_when_traceroute_already_found_some() {
+        let mut g = graph_with_hosts(&["192.168.2.1", "192.168.2.50", "192.168.2.60"]);
+        g.edges.push(HopEdge {
+            from: "192.168.2.1".parse().unwrap(),
+            to: "192.168.2.50".parse().unwrap(),
+            hop_index: 1,
+        });
+
+        finalize(
+            &mut g,
+            "192.168.2.0/24",
+            &ScanOptions::default(),
+            &Reporter::silent(),
+        );
+
+        assert_eq!(
+            g.edges.len(),
+            1,
+            "real topology data must not be supplemented with synthetic edges"
+        );
+    }
+
+    #[test]
+    fn finalize_drops_off_target_hosts_unless_asked_to_keep_them() {
+        let hosts = &["192.168.2.10", "172.17.0.1"];
+
+        let mut filtered = graph_with_hosts(hosts);
+        finalize(
+            &mut filtered,
+            "192.168.2.0/24",
+            &ScanOptions::default(),
+            &Reporter::silent(),
+        );
+        assert!(
+            !filtered
+                .hosts
+                .contains_key(&"172.17.0.1".parse::<IpAddr>().unwrap()),
+            "the docker bridge address is outside the target CIDR"
+        );
+
+        let mut kept = graph_with_hosts(hosts);
+        let opts = ScanOptions {
+            show_off_target: true,
+            ..Default::default()
+        };
+        finalize(&mut kept, "192.168.2.0/24", &opts, &Reporter::silent());
+        assert_eq!(kept.hosts.len(), 2, "--show-off-target keeps everything");
+    }
+
+    #[test]
+    fn finalize_reports_the_gateway_to_a_listening_reporter() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut g = graph_with_hosts(&["192.168.2.1", "192.168.2.9"]);
+
+        finalize(
+            &mut g,
+            "192.168.2.0/24",
+            &ScanOptions::default(),
+            &Reporter::new(tx),
+        );
+
+        let mut saw_gateway = false;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, ScanEvent::GatewayIdentified(ip) if ip == "192.168.2.1".parse::<IpAddr>().unwrap())
+            {
+                saw_gateway = true;
+            }
+        }
+        assert!(
+            saw_gateway,
+            "the GUI needs to be told which host is the gateway"
+        );
     }
 }

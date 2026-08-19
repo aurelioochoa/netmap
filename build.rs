@@ -18,7 +18,9 @@ fn main() {
         }
     } else {
         if which::which("arp").is_err() {
-            println!("cargo:warning=arp not found in PATH. The 'ip-neigh' backend will be unavailable.");
+            println!(
+                "cargo:warning=arp not found in PATH. The 'ip-neigh' backend will be unavailable."
+            );
         }
     }
 }

@@ -1,15 +1,22 @@
+use super::{run_with_limits, PartialHost, ScanBackend, ScanOptions, ScanResult};
 use crate::model::BackendKind;
-use super::{PartialHost, ScanBackend, ScanOptions, ScanResult};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::net::IpAddr;
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 pub struct IpNeighBackend;
 
 impl IpNeighBackend {
     pub fn new() -> Self {
         Self
+    }
+}
+
+impl Default for IpNeighBackend {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -27,7 +34,12 @@ impl ScanBackend for IpNeighBackend {
         }
     }
 
-    async fn scan(&self, _target: &str, _opts: &ScanOptions) -> Result<ScanResult> {
+    async fn scan(
+        &self,
+        _target: &str,
+        opts: &ScanOptions,
+        cancel: &CancellationToken,
+    ) -> Result<ScanResult> {
         let (program, args): (&str, &[&str]) = if cfg!(target_os = "linux") {
             ("ip", &["neigh", "show"])
         } else {
@@ -35,7 +47,9 @@ impl ScanBackend for IpNeighBackend {
         };
         tracing::info!(cmd = %format!("{} {}", program, args.join(" ")), "ip-neigh: executing");
 
-        let output = Command::new(program).args(args).output().await?;
+        let mut cmd = Command::new(program);
+        cmd.args(args);
+        let output = run_with_limits(cmd, opts.stage_timeout_secs, cancel, "ip-neigh").await?;
 
         tracing::debug!(
             exit = ?output.status.code(),
