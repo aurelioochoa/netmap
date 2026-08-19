@@ -8,11 +8,16 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock* build.rs ./
 COPY src/ src/
 COPY tests/ tests/
+# The gui crate is a workspace member, so cargo needs its manifest to resolve
+# the workspace even though this image never builds it (eframe would drag in
+# the whole desktop graphics stack).
+COPY gui/Cargo.toml gui/Cargo.toml
+COPY gui/src/ gui/src/
 
-RUN cargo build --release
+RUN cargo build --release -p netmap
 
 FROM builder AS test
-RUN cargo test -- --nocapture
+RUN cargo test -p netmap -- --nocapture
 
 FROM debian:bookworm-slim
 

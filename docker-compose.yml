@@ -14,4 +14,4 @@ services:
       RUST_LOG: ${RUST_LOG:-info}
     # Force stdout/stderr to be unbuffered so logs appear live in `docker compose up`.
     tty: true
-    command: ["scan", "192.168.2.0/24", "--no-tui"]
+    command: ["scan", "192.168.2.0/24"]
